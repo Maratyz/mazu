@@ -7,3 +7,4 @@ rootfs/bin/
 !.cppcheck-suppress
 !.gitignore
 compile_commands.json
+tools/kconfig

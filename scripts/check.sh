@@ -111,22 +111,33 @@ RESET='\033[0m'
 SECTION_NAME=""
 SECTION_FAIL=0
 
+timestamp_now() {
+    if [ -n "${EPOCHREALTIME-}" ]; then
+        printf '%s\n' "$EPOCHREALTIME"
+    else
+        python3 -c 'import time; print(time.time())'
+    fi
+}
+
 section_begin() {
     SECTION_NAME="$1"
     SECTION_FAIL=$FAIL
     SECTION_PASS=$PASS
     SECTION_SKIP=$SKIP
+    SECTION_T0=$(timestamp_now)
 }
 
 section_end() {
     local SECTION_PASS_COUNT=$((PASS - SECTION_PASS))
     local SECTION_SKIP_COUNT=$((SKIP - SECTION_SKIP))
+    local elapsed
+    elapsed=$(awk -v a="$(timestamp_now)" -v b="$SECTION_T0" 'BEGIN{printf "%5.2fs", a-b}')
     if [ "$FAIL" -ne "$SECTION_FAIL" ]; then
-        printf "Test %-40s[ ${RED}FAIL${RESET} ]\n" "$SECTION_NAME"
+        printf "Test %-40s[ ${RED}FAIL${RESET} ] %s\n" "$SECTION_NAME" "$elapsed"
     elif [ "$SECTION_PASS_COUNT" -eq 0 ] && [ "$SECTION_SKIP_COUNT" -gt 0 ]; then
-        printf "Test %-40s[ SKIP ]\n" "$SECTION_NAME"
+        printf "Test %-40s[ SKIP ] %s\n" "$SECTION_NAME" "$elapsed"
     else
-        printf "Test %-40s[ ${GREEN}OK${RESET} ]\n" "$SECTION_NAME"
+        printf "Test %-40s[ ${GREEN}OK${RESET} ] %s\n" "$SECTION_NAME" "$elapsed"
     fi
 }
 
@@ -206,6 +217,31 @@ check_body_contains() {
     fail "$desc" "body missing '$needle'"
 }
 
+# Fetch a URL once, assert status code, then assert body contains every needle.
+# Usage: check_url <desc> <url> <expect_status> [needle1 ...]
+check_url() {
+    local desc="$1" url="$2" expect="$3"
+    shift 3
+    local resp body status retries=5
+    while [ "$retries" -gt 0 ]; do
+        resp=$(curl -s -w '\n%{http_code}' --max-time 8 "$url" 2>/dev/null) || true
+        status="${resp##*$'\n'}"
+        body="${resp%$'\n'*}"
+        [ -n "$status" ] && [ "$status" != "000" ] && break
+        retries=$((retries - 1))
+        sleep 1
+        slirp_probe
+    done
+    if [ "$status" = "$expect" ]; then
+        pass
+    else fail "$desc status" "expected $expect, got ${status:-000}"; fi
+    for needle in "$@"; do
+        if echo "$body" | grep -qF "$needle"; then
+            pass
+        else fail "$desc body" "body missing '$needle'"; fi
+    done
+}
+
 # Send a raw HTTP request via python3 socket and extract the status code.
 # Usage: check_raw_status "description" <expected_code> <raw_request>
 # Literal \r and \n sequences in <raw_request> are converted to CR/LF.
@@ -278,10 +314,8 @@ print(parts[1] if len(parts) >= 2 else "000")
 
 test_static_files() {
     section_begin "static files"
-    check_status "GET /" "$BASE_URL/" 200
-    check_body_contains "GET / body" "$BASE_URL/" "dashboard.html"
-    check_status "GET /shell.html" "$BASE_URL/shell.html" 200
-    check_body_contains "GET /shell.html body" "$BASE_URL/shell.html" "Shell"
+    check_url "GET /" "$BASE_URL/" 200 "dashboard.html"
+    check_url "GET /shell.html" "$BASE_URL/shell.html" 200 "Shell"
     check_status "GET /index.html" "$BASE_URL/index.html" 200
     section_end
 }
@@ -840,33 +874,16 @@ test_nslookup() {
 
 test_api_stats() {
     section_begin "API /api/stats"
-    check_status "GET /api/stats" "$BASE_URL/api/stats" 200
-    check_body_contains "/api/stats tasks" "$BASE_URL/api/stats" '"tasks"'
-    check_body_contains "/api/stats memory" "$BASE_URL/api/stats" '"memory"'
-    check_body_contains "/api/stats cpus" "$BASE_URL/api/stats" '"cpus"'
-    check_body_contains "/api/stats nr_timer" "$BASE_URL/api/stats" '"nr_timer"'
-    check_body_contains "/api/stats nr_exti" "$BASE_URL/api/stats" '"nr_exti"'
-    check_body_contains "/api/stats nr_ssi" "$BASE_URL/api/stats" '"nr_ssi"'
-    check_body_contains "/api/stats watchdog" "$BASE_URL/api/stats" '"watchdog"'
-    check_body_contains "/api/stats nr_hung" "$BASE_URL/api/stats" '"nr_hung"'
-    check_body_contains "/api/stats last_activity_ms" "$BASE_URL/api/stats" '"last_activity_ms"'
-    check_body_contains "/api/stats hung field" "$BASE_URL/api/stats" '"hung"'
-    check_body_contains "/api/stats callout" "$BASE_URL/api/stats" '"callout"'
-    check_body_contains "/api/stats dispatched" "$BASE_URL/api/stats" '"dispatched"'
-    check_body_contains "/api/stats max_late_us" "$BASE_URL/api/stats" '"max_late_us"'
-    check_body_contains "/api/stats late_hist" "$BASE_URL/api/stats" '"late_hist"'
-    check_body_contains "/api/stats nr_enqueue" "$BASE_URL/api/stats" '"nr_enqueue"'
-    check_body_contains "/api/stats nr_dequeue" "$BASE_URL/api/stats" '"nr_dequeue"'
-    check_body_contains "/api/stats nr_sched_ops" "$BASE_URL/api/stats" '"nr_sched_ops"'
-    check_body_contains "/api/stats max_sched_ops" "$BASE_URL/api/stats" '"max_sched_ops"'
-    check_body_contains "/api/stats total_wait_ticks" "$BASE_URL/api/stats" '"total_wait_ticks"'
-    check_body_contains "/api/stats nr_ctxsw" "$BASE_URL/api/stats" '"nr_ctxsw"'
-    check_body_contains "/api/stats ctxsw_avg_cycles" "$BASE_URL/api/stats" '"ctxsw_avg_cycles"'
-    check_body_contains "/api/stats ctxsw_max_cycles" "$BASE_URL/api/stats" '"ctxsw_max_cycles"'
-    check_body_contains "/api/stats nr_migrations" "$BASE_URL/api/stats" '"nr_migrations"'
-    check_body_contains "/api/stats security" "$BASE_URL/api/stats" '"security"'
-    check_body_contains "/api/stats nr_denied" "$BASE_URL/api/stats" '"nr_denied"'
-    check_body_contains "/api/stats nr_enosys" "$BASE_URL/api/stats" '"nr_enosys"'
+    check_url "/api/stats" "$BASE_URL/api/stats" 200 \
+        '"tasks"' '"memory"' '"cpus"' \
+        '"nr_timer"' '"nr_exti"' '"nr_ssi"' \
+        '"watchdog"' '"nr_hung"' '"last_activity_ms"' '"hung"' \
+        '"callout"' '"dispatched"' '"max_late_us"' '"late_hist"' \
+        '"nr_enqueue"' '"nr_dequeue"' '"nr_sched_ops"' '"max_sched_ops"' \
+        '"total_wait_ticks"' \
+        '"nr_ctxsw"' '"ctxsw_avg_cycles"' '"ctxsw_max_cycles"' \
+        '"nr_migrations"' \
+        '"security"' '"nr_denied"' '"nr_enosys"'
     section_end
 }
 
@@ -915,31 +932,23 @@ test_smp_coverage() {
 
 test_api_tcp() {
     section_begin "API /api/tcp"
-    check_status "GET /api/tcp" "$BASE_URL/api/tcp" 200
-    check_body_contains "/api/tcp connections" "$BASE_URL/api/tcp" '"connections"'
-    check_body_contains "/api/tcp cwnd" "$BASE_URL/api/tcp" '"cwnd"'
-    check_body_contains "/api/tcp ssthresh" "$BASE_URL/api/tcp" '"ssthresh"'
-    check_body_contains "/api/tcp pkts_sent" "$BASE_URL/api/tcp" '"pkts_sent"'
-    check_body_contains "/api/tcp bytes_recv" "$BASE_URL/api/tcp" '"bytes_recv"'
-    check_body_contains "/api/tcp retransmits" "$BASE_URL/api/tcp" '"retransmits"'
+    check_url "/api/tcp" "$BASE_URL/api/tcp" 200 \
+        '"connections"' '"cwnd"' '"ssthresh"' \
+        '"pkts_sent"' '"bytes_recv"' '"retransmits"'
     section_end
 }
 
 test_api_arp() {
     section_begin "API /api/arp"
-    check_status "GET /api/arp" "$BASE_URL/api/arp" 200
-    check_body_contains "/api/arp entries" "$BASE_URL/api/arp" '"entries"'
+    check_url "/api/arp" "$BASE_URL/api/arp" 200 '"entries"'
     section_end
 }
 
 test_api_fs() {
     section_begin "API /api/fs"
-    check_status "GET /api/fs?path=/" "$BASE_URL/api/fs?path=/" 200
-    check_body_contains "/api/fs web dir" "$BASE_URL/api/fs?path=/" '"web"'
-
+    check_url "/api/fs?path=/" "$BASE_URL/api/fs?path=/" 200 '"web"'
     # Percent-encoded path: %2F is '/', must be decoded by the server.
-    check_status "GET /api/fs?path=%2F" "$BASE_URL/api/fs?path=%2F" 200
-    check_body_contains "/api/fs %2F web" "$BASE_URL/api/fs?path=%2F" '"web"'
+    check_url "/api/fs?path=%2F" "$BASE_URL/api/fs?path=%2F" 200 '"web"'
 
     # Subdirectory listing with encoded path (matches browser encodeURIComponent).
     check_status "GET /api/fs?path=%2Fweb" "$BASE_URL/api/fs?path=%2Fweb" 200
@@ -948,8 +957,8 @@ test_api_fs() {
     check_status "GET /api/fs?path=bad" "$BASE_URL/api/fs?path=bad" 400
 
     # /api/fs/read — file content retrieval.
-    check_status "GET /api/fs/read hello.txt" "$BASE_URL/api/fs/read?path=%2Fhello.txt" 200
-    check_body_contains "/api/fs/read content" "$BASE_URL/api/fs/read?path=%2Fhello.txt" 'Hello friend'
+    check_url "GET /api/fs/read hello.txt" "$BASE_URL/api/fs/read?path=%2Fhello.txt" \
+        200 'Hello friend'
     check_status "GET /api/fs/read not-found" "$BASE_URL/api/fs/read?path=%2Fno_such_file" 404
     check_status "GET /api/fs/read missing param" "$BASE_URL/api/fs/read" 400
     check_status "GET /api/fs/read dir" "$BASE_URL/api/fs/read?path=%2Fweb" 404
@@ -958,9 +967,7 @@ test_api_fs() {
 
 test_api_klog() {
     section_begin "API /api/klog"
-    check_status "GET /api/klog" "$BASE_URL/api/klog" 200
-    check_body_contains "/api/klog log" "$BASE_URL/api/klog" '"log"'
-    check_body_contains "/api/klog dropped" "$BASE_URL/api/klog" '"dropped"'
+    check_url "/api/klog" "$BASE_URL/api/klog" 200 '"log"' '"dropped"'
     section_end
 }
 
@@ -1165,14 +1172,10 @@ test_web_ui() {
     section_begin "web UI"
 
     # Pages
-    check_status "GET /dashboard.html" "$BASE_URL/dashboard.html" 200
-    check_body_contains "dashboard body" "$BASE_URL/dashboard.html" "Dashboard"
-    check_status "GET /files.html" "$BASE_URL/files.html" 200
-    check_body_contains "files body" "$BASE_URL/files.html" "File Browser"
-    check_status "GET /network.html" "$BASE_URL/network.html" 200
-    check_body_contains "network body" "$BASE_URL/network.html" "Network"
-    check_status "GET /telemetry.html" "$BASE_URL/telemetry.html" 200
-    check_body_contains "telemetry body" "$BASE_URL/telemetry.html" "Telemetry"
+    check_url "GET /dashboard.html" "$BASE_URL/dashboard.html" 200 "Dashboard"
+    check_url "GET /files.html" "$BASE_URL/files.html" 200 "File Browser"
+    check_url "GET /network.html" "$BASE_URL/network.html" 200 "Network"
+    check_url "GET /telemetry.html" "$BASE_URL/telemetry.html" 200 "Telemetry"
 
     # Static assets referenced by pages
     check_status "GET /css/style.css" "$BASE_URL/css/style.css" 200
@@ -1200,7 +1203,7 @@ test_spawn_hello() {
     if echo "$body" | grep -qF "spawned"; then
         pass
     else fail "spawn spawned" "expected 'spawned', body: $body"; fi
-    # Give the user task time to run.
+    # Give the user task time to run before the next test polls ps.
     sleep 1
     section_end
 }

@@ -35,10 +35,7 @@ extern int test_parse_u64_non_digit(void);
 extern int test_parse_u64_overflow(void);
 extern int test_parse_u64_leading_alpha(void);
 
-#define TEST(f) \
-    {           \
-        #f, f   \
-    }
+#define TEST(f) {#f, f}
 
 static struct test_case tests[] = {
     /* TCP sequence number arithmetic */

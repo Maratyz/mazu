@@ -325,7 +325,7 @@ menu "Build Options"
           changes, TCP state transitions, and syscall entry/exit.
           Events are written through the printk path and can be
           replayed by scripts/check_eventv1.py for offline
-          verification.  See docs/EVENTV1_SPEC.md for the schema.
+          verification.  See the event schema notes for the schema.
           Zero overhead when disabled.
 
     config EVENTLOG_SYSCALLS

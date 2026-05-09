@@ -8,12 +8,18 @@ syntaxError:arch/riscv64/entry.c
 syntaxError:arch/riscv64/sbi.c
 syntaxError:arch/riscv64/semihost.c
 
+# tests/tests-sbi.c reloads sstatus via inline asm between two reads;
+# cppcheck cannot model the asm side effect and thinks the second
+# 'sstatus_mid & 2' is identical to the first.
+identicalConditionAfterEarlyExit:tests/tests-sbi.c
+
 # Platform-specific #error is intentional (guards unsupported sizeof(sz))
 preprocessorErrorDirective:include/mazu/arena.h
 
 # Linker-section pointer arithmetic is standard kernel practice
 # (__initcall_start / __initcall_end, __selftest_start / __selftest_end)
 subtractPointers:kernel/init/initgraph.c
+comparePointers:kernel/init/initgraph.c
 comparePointers:kernel/init/hooks.c
 subtractPointers:lib/selftest.c
 comparePointers:lib/selftest.c

@@ -4,7 +4,7 @@ KTRACE replay verification checker for the Mazu RISC-V kernel.
 
 Parses KTRACE structured event lines from a QEMU serial log and replays
 them against a shadow state model.  Flags any transition that violates
-the state machine rules defined in docs/KTRACE_SPEC.md.
+the state machine rules defined by the event schema notes.
 
 Exit codes:
     0  -- no violations (or no KTRACE lines found)

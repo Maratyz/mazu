@@ -1,0 +1,9 @@
+*.bin
+build/
+rootfs/bin/
+.*
+!.clangd
+!.clang-format
+!.cppcheck-suppress
+!.gitignore
+compile_commands.json

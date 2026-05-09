@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mazu Dashboard</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-title">Mazu OS</div>
+  <a href="/dashboard.html">Dashboard</a>
+  <a href="/files.html">Files</a>
+  <a href="/network.html">Network</a>
+  <a href="/telemetry.html">Telemetry</a>
+  <a href="/shell.html">Shell</a>
+</nav>
+
+<div class="main">
+  <div class="page-header">
+    <div class="status-dot connecting" id="dot"></div>
+    <h1>Dashboard</h1>
+    <span id="uptime" style="margin-left:auto;font-size:12px;color:#8b949e"></span>
+  </div>
+
+  <div class="page-content">
+    <div class="grid grid-3" id="stats-row">
+      <div class="card">
+        <h2>Uptime</h2>
+        <div class="stat-value" id="val-uptime">--</div>
+      </div>
+      <div class="card">
+        <h2>Memory</h2>
+        <div class="stat-value" id="val-mem">--</div>
+        <div class="stat-label" id="val-mem-detail"></div>
+        <div class="gauge"><div class="gauge-fill" id="mem-gauge"></div></div>
+      </div>
+      <div class="card">
+        <h2>TCP</h2>
+        <div class="stat-value" id="val-tcp">--</div>
+        <div class="stat-label" id="val-tcp-detail"></div>
+      </div>
+    </div>
+
+    <div class="grid grid-2">
+      <div class="card">
+        <h2>HTTP Errors</h2>
+        <div class="stat-label">
+          4xx: <span id="val-4xx">0</span> &nbsp; 5xx: <span id="val-5xx">0</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Network I/O</h2>
+        <div class="stat-label">
+          TX: <span id="val-tx">0</span> &nbsp; RX: <span id="val-rx">0</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Tasks</h2>
+      <table>
+        <thead><tr><th>ID</th><th>State</th><th>Priority</th><th>CPU Time</th></tr></thead>
+        <tbody id="task-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+'use strict';
+
+var dot = document.getElementById('dot');
+
+function refresh() {
+    fetchJSON('/api/stats').then(function (d) {
+        dot.className = 'status-dot';
+        document.getElementById('val-uptime').textContent = formatDuration(d.uptime_ms);
+        document.getElementById('uptime').textContent = formatDuration(d.uptime_ms);
+
+        var mem = d.memory;
+        var used = mem.total_pages - mem.free_pages;
+        var pct = mem.total_pages ? Math.round(100 * used / mem.total_pages) : 0;
+        document.getElementById('val-mem').textContent = pct + '%';
+        document.getElementById('val-mem-detail').textContent =
+            used + ' / ' + mem.total_pages + ' pages';
+        var gf = document.getElementById('mem-gauge');
+        gf.style.width = pct + '%';
+        gf.className = 'gauge-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warn' : '');
+
+        var tcp = d.tcp;
+        document.getElementById('val-tcp').textContent = tcp.connections;
+        document.getElementById('val-tcp-detail').textContent =
+            'retx: ' + tcp.retransmits;
+        document.getElementById('val-4xx').textContent = d.http['4xx'];
+        document.getElementById('val-5xx').textContent = d.http['5xx'];
+        document.getElementById('val-tx').textContent = formatBytes(tcp.bytes_tx);
+        document.getElementById('val-rx').textContent = formatBytes(tcp.bytes_rx);
+
+        var tb = document.getElementById('task-body');
+        tb.innerHTML = '';
+        d.tasks.forEach(function (t) {
+            var tr = document.createElement('tr');
+            tr.innerHTML = '<td>' + t.id + '</td><td>' + t.state +
+                '</td><td>' + t.prio + '</td><td>' + t.cpu_us + ' us</td>';
+            tb.appendChild(tr);
+        });
+    }).catch(function () {
+        dot.className = 'status-dot offline';
+    });
+}
+
+createPoller(refresh, 2000).start();
+</script>
+</body>
+</html>

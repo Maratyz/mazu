@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mazu Files</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-title">Mazu OS</div>
+  <a href="/dashboard.html">Dashboard</a>
+  <a href="/files.html">Files</a>
+  <a href="/network.html">Network</a>
+  <a href="/telemetry.html">Telemetry</a>
+  <a href="/shell.html">Shell</a>
+</nav>
+
+<div class="main">
+  <div class="page-header">
+    <h1>File Browser</h1>
+  </div>
+
+  <div class="page-content">
+    <div class="breadcrumb" id="breadcrumb"></div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Name</th><th>Type</th></tr></thead>
+        <tbody id="file-body"></tbody>
+      </table>
+    </div>
+    <pre id="file-view" style="display:none;background:var(--bg-alt);border:1px solid var(--border);border-radius:6px;padding:14px;overflow:auto;max-height:50vh;font-size:13px;color:var(--fg)"></pre>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+'use strict';
+
+var currentPath = '/';
+var breadcrumb = document.getElementById('breadcrumb');
+var fileBody = document.getElementById('file-body');
+var fileView = document.getElementById('file-view');
+
+function renderBreadcrumb(p) {
+    breadcrumb.innerHTML = '';
+    var parts = p.split('/').filter(Boolean);
+    var a = document.createElement('a');
+    a.textContent = '/';
+    a.onclick = function () { navigate('/'); };
+    breadcrumb.appendChild(a);
+    var acc = '';
+    parts.forEach(function (seg) {
+        var sp = document.createElement('span');
+        sp.textContent = ' / ';
+        breadcrumb.appendChild(sp);
+        acc += '/' + seg;
+        var link = document.createElement('a');
+        link.textContent = seg;
+        (function (target) { link.onclick = function () { navigate(target); }; })(acc);
+        breadcrumb.appendChild(link);
+    });
+}
+
+function navigate(path) {
+    currentPath = path;
+    fileView.style.display = 'none';
+    renderBreadcrumb(path);
+    fetchJSON('/api/fs?path=' + encodeURIComponent(path)).then(function (d) {
+        fileBody.innerHTML = '';
+        d.entries.forEach(function (e) {
+            var tr = document.createElement('tr');
+            var fullPath = (path === '/' ? '/' : path + '/') + e.name;
+            if (e.type === 'dir') {
+                tr.innerHTML = '<td><a style="color:var(--blue);cursor:pointer">' +
+                    e.name + '/</a></td><td>dir</td>';
+                tr.querySelector('a').onclick = function () { navigate(fullPath); };
+            } else {
+                tr.innerHTML = '<td><a style="color:var(--fg-bright);cursor:pointer">' +
+                    e.name + '</a></td><td>file</td>';
+                tr.querySelector('a').onclick = function () { viewFile(fullPath); };
+            }
+            fileBody.appendChild(tr);
+        });
+    }).catch(function () {
+        fileBody.innerHTML = '<tr><td colspan="2">Error loading directory</td></tr>';
+    });
+}
+
+function viewFile(path) {
+    fetch('/api/fs/read?path=' + encodeURIComponent(path), { cache: 'no-store' }).then(function (r) {
+        if (!r.ok) throw new Error(r.status);
+        return r.text();
+    }).then(function (text) {
+        fileView.style.display = 'block';
+        fileView.textContent = text;
+    }).catch(function () {
+        fileView.style.display = 'block';
+        fileView.textContent = '(binary or unreadable)';
+    });
+}
+
+navigate('/');
+</script>
+</body>
+</html>

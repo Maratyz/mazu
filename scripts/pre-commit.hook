@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# Git pre-commit hook for Mazu RTOS.
+# Checks staged C/H files for formatting, unsafe patterns, and static analysis.
+#
+# Install:  make install-hooks
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+
+# shellcheck source=common.sh
+. scripts/common.sh
+set_colors
+
+# --- Collect staged files -----------------------------------------------------
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACM)
+
+c_files=()
+h_files=()
+py_files=()
+sh_files=()
+for f in "${staged[@]}"; do
+    case "$f" in
+        *.c) c_files+=("$f") ;;
+        *.h) h_files+=("$f") ;;
+        *.py) py_files+=("$f") ;;
+        *.sh) sh_files+=("$f") ;;
+    esac
+done
+
+ch_files=("${c_files[@]}" "${h_files[@]}")
+
+if [ ${#staged[@]} -eq 0 ]; then
+    exit 0
+fi
+
+errors=()
+warnings=()
+total_checks=0
+pass_checks=0
+
+report_check() {
+    local n="$1" total="$2" name="$3" result="$4"
+    if [ "$result" = "pass" ]; then
+        printf "  ${GREEN}[%d/%d]${NC} %s\n" "$n" "$total" "$name"
+        pass_checks=$((pass_checks + 1))
+    elif [ "$result" = "skip" ]; then
+        printf "  ${YELLOW}[%d/%d]${NC} %s ${YELLOW}(skipped)${NC}\n" "$n" "$total" "$name"
+    else
+        printf "  ${RED}[%d/%d]${NC} %s ${RED}FAIL${NC}\n" "$n" "$total" "$name"
+    fi
+}
+
+# Determine how many checks we'll run
+total_checks=4
+[ ${#c_files[@]} -gt 0 ] && total_checks=5
+
+echo "pre-commit: ${#staged[@]} staged file(s)"
+step=0
+
+# --- Check 1: Merge conflict markers -----------------------------------------
+
+step=$((step + 1))
+conflict_files=()
+for f in "${staged[@]}"; do
+    if git show ":$f" 2>/dev/null | grep -qE '^(<{7}|={7}|>{7})'; then
+        conflict_files+=("$f")
+    fi
+done
+if [ ${#conflict_files[@]} -gt 0 ]; then
+    report_check "$step" "$total_checks" "Merge conflict markers" "fail"
+    for f in "${conflict_files[@]}"; do
+        errors+=("  conflict marker in: $f")
+    done
+else
+    report_check "$step" "$total_checks" "Merge conflict markers" "pass"
+fi
+
+# --- Check 2: Code formatting ------------------------------------------------
+
+step=$((step + 1))
+if [ ${#ch_files[@]} -gt 0 ]; then
+    CLANG_FMT="${CLANG_FMT:-clang-format}"
+    if command -v "$CLANG_FMT" >/dev/null 2>&1; then
+        fmt_failures=()
+        for f in "${ch_files[@]}"; do
+            if ! git show ":$f" | "$CLANG_FMT" --style=file --dry-run --Werror \
+                2>/dev/null; then
+                fmt_failures+=("$f")
+            fi
+        done
+        if [ ${#fmt_failures[@]} -gt 0 ]; then
+            report_check "$step" "$total_checks" "Code formatting (clang-format)" "fail"
+            for f in "${fmt_failures[@]}"; do
+                errors+=("  format: $f")
+            done
+            errors+=("  fix: make indent")
+        else
+            report_check "$step" "$total_checks" "Code formatting (clang-format)" "pass"
+        fi
+    else
+        report_check "$step" "$total_checks" "Code formatting (clang-format)" "skip"
+    fi
+else
+    report_check "$step" "$total_checks" "Code formatting (clang-format)" "pass"
+fi
+
+# --- Check 3: Unsafe C functions ----------------------------------------------
+
+step=$((step + 1))
+if [ ${#ch_files[@]} -gt 0 ]; then
+    unsafe_hits=()
+    for f in "${ch_files[@]}"; do
+        # Check the staged content for dangerous libc-style calls.
+        # In a freestanding kernel these should never appear.
+        while IFS= read -r line; do
+            unsafe_hits+=("$line")
+        done < <(git show ":$f" | grep -nE '\b(gets|sprintf|strcpy|strcat|atoi)\s*\(' \
+            | sed "s|^|  $f:|" || true)
+    done
+    if [ ${#unsafe_hits[@]} -gt 0 ]; then
+        report_check "$step" "$total_checks" "Unsafe function usage" "fail"
+        for h in "${unsafe_hits[@]}"; do
+            errors+=("$h")
+        done
+    else
+        report_check "$step" "$total_checks" "Unsafe function usage" "pass"
+    fi
+else
+    report_check "$step" "$total_checks" "Unsafe function usage" "pass"
+fi
+
+# --- Check 4: Non-ASCII filenames --------------------------------------------
+
+step=$((step + 1))
+non_ascii=$(git diff --cached --name-only --diff-filter=A -z | LC_ALL=C tr -d '[ -~]\0' | wc -c)
+if [ "$non_ascii" -gt 0 ]; then
+    report_check "$step" "$total_checks" "Non-ASCII filenames" "fail"
+    errors+=("  New files with non-ASCII names are not allowed.")
+else
+    report_check "$step" "$total_checks" "Non-ASCII filenames" "pass"
+fi
+
+# --- Check 5: Static analysis (staged .c only) -------------------------------
+
+if [ ${#c_files[@]} -gt 0 ]; then
+    step=$((step + 1))
+    if [ ! -f build/config.h ] || [ ! -f compile_commands.json ]; then
+        report_check "$step" "$total_checks" "Static analysis" "skip"
+        warnings+=("  Run 'make' and 'make compile_commands.json' for static analysis.")
+    else
+        # Filter to files present in compile_commands.json
+        mapfile -t compdb_files < <(python3 -c "
+import json
+files = {e['file'] for e in json.load(open('compile_commands.json'))}
+for f in '''$(printf '%s\n' "${c_files[@]}")'''.strip().splitlines():
+    if f in files:
+        print(f)
+")
+        if [ ${#compdb_files[@]} -eq 0 ]; then
+            report_check "$step" "$total_checks" "Static analysis" "pass"
+        else
+            analysis_out="$(mktemp)"
+            if ! CPPCHECK_BIN=_disabled SPARSE_BIN=_disabled \
+                bash ./scripts/analyze.sh "${compdb_files[@]}" \
+                >"$analysis_out" 2>&1; then
+                report_check "$step" "$total_checks" "Static analysis" "fail"
+                while IFS= read -r line; do
+                    errors+=("  $line")
+                done < <(grep -E ': (warning|error):' "$analysis_out" | head -20)
+                errors+=("  Run 'make analyze' for the full report.")
+            else
+                warn_count=$(grep -c ": warning:" "$analysis_out" || true)
+                if [ "$warn_count" -gt 0 ]; then
+                    report_check "$step" "$total_checks" "Static analysis" "pass"
+                    while IFS= read -r line; do
+                        warnings+=("  $line")
+                    done < <(grep ": warning:" "$analysis_out" | head -10)
+                else
+                    report_check "$step" "$total_checks" "Static analysis" "pass"
+                fi
+            fi
+            rm -f "$analysis_out"
+        fi
+    fi
+fi
+
+# --- Summary ------------------------------------------------------------------
+
+echo ""
+
+if [ ${#warnings[@]} -gt 0 ]; then
+    echo "${YELLOW}Warnings:${NC}"
+    printf "%s\n" "${warnings[@]}"
+fi
+
+if [ ${#errors[@]} -gt 0 ]; then
+    echo "${RED}Errors (commit blocked):${NC}"
+    printf "%s\n" "${errors[@]}"
+    exit 1
+fi
+
+exit 0

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Git commit-msg hook for Mazu RTOS.
+# Enforces commit message conventions adapted from kernel/kbox style.
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+
+# shellcheck source=common.sh
+SCRIPTS_DIR="$(cd "$(dirname "$0")/../scripts" 2>/dev/null && pwd)" \
+    || SCRIPTS_DIR="$(cd "$(dirname "$0")/../../scripts" 2>/dev/null && pwd)" \
+    || SCRIPTS_DIR=""
+if [ -n "$SCRIPTS_DIR" ] && [ -f "$SCRIPTS_DIR/common.sh" ]; then
+    . "$SCRIPTS_DIR/common.sh"
+    set_colors
+else
+    RED="" GREEN="" YELLOW="" NC=""
+fi
+
+# Read the message, stripping comments.
+mapfile -t raw_lines < "$COMMIT_MSG_FILE"
+lines=()
+for line in "${raw_lines[@]}"; do
+    [[ "$line" =~ ^# ]] && continue
+    lines+=("$line")
+done
+
+# Strip leading blank lines to find the real subject.
+while [ ${#lines[@]} -gt 0 ] && [ -z "${lines[0]}" ]; do
+    lines=("${lines[@]:1}")
+done
+
+# Skip validation for empty commits, fixup!, and merge commits.
+subject="${lines[0]:-}"
+if [ -z "$subject" ]; then
+    exit 0
+fi
+if [[ "$subject" =~ ^fixup!\ |^Merge\ |^Revert\  ]]; then
+    exit 0
+fi
+
+# Strip squash! prefix for validation (the final subject is what matters).
+if [[ "$subject" =~ ^squash!\ (.*) ]]; then
+    subject="${BASH_REMATCH[1]}"
+fi
+
+errors=()
+warns=()
+
+# --- Rule 1: Blank line between subject and body -----------------------------
+
+if [ ${#lines[@]} -gt 1 ] && [ -n "${lines[1]}" ]; then
+    errors+=("Separate subject from body with a blank line.")
+fi
+
+# --- Rule 2: Subject length --------------------------------------------------
+
+subj_len=${#subject}
+if [ "$subj_len" -gt 72 ]; then
+    errors+=("Subject line is ${subj_len} chars (hard max: 72).")
+elif [ "$subj_len" -gt 50 ]; then
+    warns+=("Subject line is ${subj_len} chars (aim for 50).")
+fi
+
+# --- Rule 3: Capitalize subject -----------------------------------------------
+
+first_char="${subject:0:1}"
+if [[ ! "$first_char" =~ [A-Z] ]]; then
+    errors+=("Capitalize the subject line (got '${first_char}').")
+fi
+
+# --- Rule 4: No trailing period -----------------------------------------------
+
+if [[ "$subject" =~ \.$ ]]; then
+    errors+=("Do not end the subject line with a period.")
+fi
+
+# --- Rule 5: Imperative mood (no past tense) ---------------------------------
+
+first_word="${subject%% *}"
+# Common past-tense / gerund words that violate imperative mood.
+past_tense_words="Added|Adds|Adding|Adjusted|Allowed|Applied|Avoided|Bumped|"
+past_tense_words+="Changed|Cleaned|Combined|Completed|Configured|Converted|"
+past_tense_words+="Corrected|Created|Decreased|Defined|Deleted|Deployed|"
+past_tense_words+="Described|Documented|Dropped|Dumped|Eliminated|Enabled|"
+past_tense_words+="Enhanced|Ensured|Established|Extended|Extracted|"
+past_tense_words+="Fixed|Handled|Hid|Ignored|Implemented|Improved|"
+past_tense_words+="Included|Increased|Introduced|Kept|Made|Merged|"
+past_tense_words+="Modified|Moved|Optimized|Passed|Patched|Prevented|"
+past_tense_words+="Rebased|Reduced|Refactored|Removed|Renamed|Reorganized|"
+past_tense_words+="Replaced|Resolved|Restored|Restricted|Reverted|Reworked|"
+past_tense_words+="Separated|Simplified|Skipped|Sorted|Started|Stopped|"
+past_tense_words+="Switched|Tested|Updated|Upgraded|Used|Verified"
+if [[ "$first_word" =~ ^(${past_tense_words})$ ]]; then
+    errors+=("Use imperative mood: '${first_word}' -> use present tense (e.g. 'Fix' not 'Fixed').")
+fi
+
+# --- Rule 6: Multi-word subject -----------------------------------------------
+
+word_count=$(echo "$subject" | wc -w)
+if [ "$word_count" -lt 2 ]; then
+    errors+=("Subject must be more than one word.")
+fi
+
+# --- Rule 7: Body lines <= 72 chars ------------------------------------------
+
+for i in "${!lines[@]}"; do
+    [ "$i" -eq 0 ] && continue  # subject checked separately
+    line="${lines[$i]}"
+    line_len=${#line}
+    if [ "$line_len" -gt 72 ]; then
+        # Exempt URLs and git trailers (Signed-off-by, etc.)
+        if [[ "$line" == http://* ]] || [[ "$line" == https://* ]] || \
+           [[ "$line" =~ ^[A-Za-z_-]+: ]]; then
+            continue
+        fi
+        warns+=("Line $((i + 1)) is ${line_len} chars (max 72).")
+    fi
+done
+
+# --- Report -------------------------------------------------------------------
+
+if [ ${#warns[@]} -gt 0 ]; then
+    echo "${YELLOW}commit-msg warnings:${NC}" >&2
+    for w in "${warns[@]}"; do
+        echo "  ${YELLOW}!${NC} $w" >&2
+    done
+fi
+
+if [ ${#errors[@]} -gt 0 ]; then
+    echo "${RED}commit-msg errors (commit blocked):${NC}" >&2
+    for e in "${errors[@]}"; do
+        echo "  ${RED}x${NC} $e" >&2
+    done
+    exit 1
+fi
+
+exit 0

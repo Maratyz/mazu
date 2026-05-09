@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mazu Network</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-title">Mazu OS</div>
+  <a href="/dashboard.html">Dashboard</a>
+  <a href="/files.html">Files</a>
+  <a href="/network.html">Network</a>
+  <a href="/telemetry.html">Telemetry</a>
+  <a href="/shell.html">Shell</a>
+</nav>
+
+<div class="main">
+  <div class="page-header">
+    <div class="status-dot connecting" id="dot"></div>
+    <h1>Network Monitor</h1>
+  </div>
+
+  <div class="page-content">
+    <div class="grid grid-2">
+      <div class="card">
+        <h2>Packet Rate</h2>
+        <div class="chart-legend" aria-hidden="true">
+          <span class="chart-legend-item chart-legend-tx">TX</span>
+          <span class="chart-legend-item chart-legend-rx">RX</span>
+        </div>
+        <canvas id="graph" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h2>Bandwidth</h2>
+        <div class="stat-label">TX: <span id="val-tx">0</span></div>
+        <div class="stat-label">RX: <span id="val-rx">0</span></div>
+        <div class="stat-label" style="margin-top:8px">Retransmits: <span id="val-retx">0</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>ARP Table</h2>
+      <table>
+        <thead><tr><th>IP Address</th><th>MAC Address</th><th>Age</th></tr></thead>
+        <tbody id="arp-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>TCP Connections</h2>
+      <table>
+        <thead><tr><th>Local</th><th>Remote</th><th>State</th></tr></thead>
+        <tbody id="tcp-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+'use strict';
+
+var dot = document.getElementById('dot');
+var canvas = document.getElementById('graph');
+var ctx2d = canvas.getContext('2d');
+var txHist = [];
+var rxHist = [];
+var maxPts = 60;
+var prevTx = null;
+var prevRx = null;
+
+function stateClass(s) {
+    s = s.toLowerCase().replace(/[_-]/g, '');
+    if (s === 'established') return 'state-established';
+    if (s === 'listen') return 'state-listen';
+    if (s === 'timewait') return 'state-time-wait';
+    if (s === 'closewait') return 'state-close-wait';
+    if (s === 'closed') return 'state-closed';
+    return '';
+}
+
+function drawGraph() {
+    var w = canvas.width = canvas.clientWidth;
+    var h = canvas.height = 120;
+    var padTop = 8;
+    var padBottom = 6;
+    ctx2d.clearRect(0, 0, w, h);
+
+    var all = txHist.concat(rxHist);
+    var maxVal = Math.max.apply(null, all.length ? all : [1]);
+    if (maxVal === 0) maxVal = 1;
+
+    function plot(arr, color) {
+        ctx2d.strokeStyle = color;
+        ctx2d.lineWidth = 1.5;
+        ctx2d.beginPath();
+        for (var i = 0; i < arr.length; i++) {
+            var x = (i / (maxPts - 1)) * w;
+            var y = h - padBottom -
+                (arr[i] / maxVal) * (h - padTop - padBottom);
+            if (i === 0) ctx2d.moveTo(x, y);
+            else ctx2d.lineTo(x, y);
+        }
+        ctx2d.stroke();
+    }
+
+    plot(txHist, '#3fb950');
+    plot(rxHist, '#58a6ff');
+}
+
+function refresh() {
+    /* Fetch both endpoints in parallel. */
+    Promise.all([
+        fetchJSON('/api/stats'),
+        fetchJSON('/api/tcp'),
+        fetchJSON('/api/arp')
+    ]).then(function (arr) {
+        var stats = arr[0], tcp = arr[1], arp = arr[2];
+        dot.className = 'status-dot';
+
+        document.getElementById('val-tx').textContent = formatBytes(stats.tcp.bytes_tx);
+        document.getElementById('val-rx').textContent = formatBytes(stats.tcp.bytes_rx);
+        document.getElementById('val-retx').textContent = stats.tcp.retransmits;
+
+        /* Delta for graph. */
+        if (prevTx !== null) {
+            txHist.push(stats.tcp.bytes_tx - prevTx);
+            rxHist.push(stats.tcp.bytes_rx - prevRx);
+            if (txHist.length > maxPts) { txHist.shift(); rxHist.shift(); }
+        }
+        prevTx = stats.tcp.bytes_tx;
+        prevRx = stats.tcp.bytes_rx;
+        drawGraph();
+
+        /* ARP table. */
+        var ab = document.getElementById('arp-body');
+        ab.innerHTML = '';
+        arp.entries.forEach(function (e) {
+            var tr = document.createElement('tr');
+            tr.innerHTML = '<td>' + e.ip + '</td><td>' + e.mac +
+                '</td><td>' + formatDuration(e.age_ms) + '</td>';
+            ab.appendChild(tr);
+        });
+
+        /* TCP connections. */
+        var tb = document.getElementById('tcp-body');
+        tb.innerHTML = '';
+        tcp.connections.forEach(function (c) {
+            var tr = document.createElement('tr');
+            var cls = stateClass(c.state);
+            tr.innerHTML = '<td>' + c.host + '</td><td>' + c.peer +
+                '</td><td class="' + cls + '">' + c.state + '</td>';
+            tb.appendChild(tr);
+        });
+    }).catch(function () {
+        dot.className = 'status-dot offline';
+    });
+}
+
+createPoller(refresh, 2000).start();
+</script>
+</body>
+</html>

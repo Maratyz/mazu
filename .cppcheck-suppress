@@ -1,0 +1,57 @@
+# Cppcheck suppressions for Mazu RTOS
+# Use this file instead of inline // cppcheck-suppress comments in source.
+
+# --- False positives in freestanding/cross-compilation context ---
+
+# RISC-V inline assembly triggers cppcheck's C parser
+syntaxError:arch/riscv64/entry.c
+syntaxError:arch/riscv64/sbi.c
+syntaxError:arch/riscv64/semihost.c
+
+# Platform-specific #error is intentional (guards unsupported sizeof(sz))
+preprocessorErrorDirective:include/mazu/arena.h
+
+# Linker-section pointer arithmetic is standard kernel practice
+# (__initcall_start / __initcall_end, __selftest_start / __selftest_end)
+subtractPointers:kernel/init/initgraph.c
+comparePointers:kernel/init/hooks.c
+subtractPointers:lib/selftest.c
+comparePointers:lib/selftest.c
+
+# --- Callback signature constraints (global, justified) ---
+
+# Callback implementations must match vtable typedefs exactly; adding const
+# to parameters would break the function-pointer ABI.  This fires on every
+# wait_cleanup, syscall handler, kthread entry, VFS op, etc.
+constParameterCallback
+
+# --- Kernel pointer-mutation patterns (global, justified) ---
+
+# spinlock, list-iteration, and pcpu access patterns use pointers that cppcheck
+# considers "could be const" but are mutated through atomics, inline asm, or
+# container_of casts that cppcheck cannot track.  Scoping these to 30+ files
+# is worse than a documented global suppress.
+constVariablePointer
+constParameterPointer
+
+# --- Concurrency / computed-goto false positives ---
+
+# spin_trylock result depends on runtime contention; cppcheck traces single-thread
+knownConditionTrueFalse:kernel/sched/core.c
+
+# posix_timer_delete clears t->armed concurrently; cppcheck can't model races
+knownConditionTrueFalse:kernel/timer/posix_timer.c
+
+# GCC label-as-value (&&label) for fault recovery; cppcheck doesn't track it
+unusedLabel:kernel/proc/uaccess.c
+
+# POSIX SIG_IGN = (sig_handler_fn_t)1 — standard convention
+intToPointerCast:kernel/proc/signal.c
+
+# p.len-- modifies the struct used in subsequent str_is_equal calls
+unreadVariable:kernel/fs/netfs.c
+
+# KTRACE macro compiles to nothing when eventlog is disabled; variables used
+# only in KTRACE appear unused in that configuration
+unreadVariable:kernel/proc/syscall.c
+unreadVariable:kernel/sched/deadline.c

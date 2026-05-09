@@ -1,0 +1,600 @@
+/* SPDX-License-Identifier: MIT */
+/* Process table management.
+ *
+ * Process lifecycle: FREE -> EMBRYO (alloc) -> RUNNING (activated) ->
+ * ZOMBIE (exit) -> FREE (reaped by parent or auto-reaped).
+ * SLEEPING and STOPPED are intermediate states for I/O and signals.
+ */
+
+#include <mazu/assert.h>
+#include <mazu/kvalloc.h>
+#include <mazu/paging.h>
+#include <mazu/print.h>
+#include <mazu/proc.h>
+#include <mazu/string.h>
+#include <mazu/time.h>
+#include <mazu/uaccess.h>
+
+#include "../lockdep.h"
+#include "../sched/waitqueue.h"
+#include "../sync/futex.h"
+#include "../sync/sync_handle.h"
+#include "../timer/posix_timer.h"
+#include "pipe.h"
+
+static struct proc proc_table[PROC_MAX];
+spinlock_t proc_table_lock = SPINLOCK_INITIALIZER;
+static u16 next_pid = 1;
+
+/* Per-process child wait queues: parent blocks here until a child
+ * enters ZOMBIE.  Indexed by proc_table slot, not by PID.
+ */
+static struct wait_queue_head child_wqs[PROC_MAX];
+
+static sz proc_slot(struct proc *p)
+{
+    DEBUG_ASSERT(p >= &proc_table[0] && p < &proc_table[PROC_MAX]);
+    return (sz) (p - proc_table);
+}
+
+u64 proc_table_lock_irqsave(void)
+{
+    lockdep_acquire(LOCK_LEVEL_PROC);
+    return spin_lock_irqsave(&proc_table_lock);
+}
+
+void proc_table_unlock_irqrestore(u64 flags)
+{
+    spin_unlock_irqrestore(&proc_table_lock, flags);
+    lockdep_release(LOCK_LEVEL_PROC);
+}
+
+u64 proc_fd_lock_irqsave(struct proc *p)
+{
+    assert(p);
+    lockdep_acquire(LOCK_LEVEL_FD);
+    return spin_lock_irqsave(&p->fd_lock);
+}
+
+void proc_fd_unlock_irqrestore(struct proc *p, u64 flags)
+{
+    assert(p);
+    spin_unlock_irqrestore(&p->fd_lock, flags);
+    lockdep_release(LOCK_LEVEL_FD);
+}
+
+u64 proc_sig_lock_irqsave(struct proc *p)
+{
+    assert(p);
+    lockdep_acquire(LOCK_LEVEL_SIG);
+    return spin_lock_irqsave(&p->sig_lock);
+}
+
+void proc_sig_unlock_irqrestore(struct proc *p, u64 flags)
+{
+    assert(p);
+    spin_unlock_irqrestore(&p->sig_lock, flags);
+    lockdep_release(LOCK_LEVEL_SIG);
+}
+
+static u16 proc_alloc_pid_locked(void)
+{
+    for (u32 attempts = 0; attempts < U16_MAX; attempts++) {
+        if (next_pid == 0)
+            next_pid = 1; /* PID 0 is reserved/invalid. */
+        u16 pid = next_pid++;
+        bool in_use = false;
+        for (sz i = 0; i < PROC_MAX; i++) {
+            if (proc_table[i].state != PROC_STATE_FREE &&
+                proc_table[i].pid == pid) {
+                in_use = true;
+                break;
+            }
+        }
+        if (!in_use)
+            return pid;
+    }
+    return 0;
+}
+
+static void proc_close_fd_impl(struct proc *p, i32 fd)
+{
+    struct proc_fd *f = &p->fd_table[fd];
+    if (!f->is_open)
+        return;
+
+    /* Release the underlying resource before clearing the slot.
+     * The is_seekable check (instead of fd > PROC_FD_STDERR) ensures
+     * vfs_close runs for VFS files redirected onto stdio via spawn
+     * file actions.  Console FDs (is_seekable == false) are skipped.
+     */
+    if (f->is_pipe) {
+        if (f->pipe_read_end)
+            pipe_close_read(f->pipe);
+        else
+            pipe_close_write(f->pipe);
+    } else if (f->is_seekable && !f->is_dup) {
+        vfs_close(&f->file);
+    }
+
+    /* Zero the entire slot to reset all fields at once. */
+    memset(f, 0, sizeof(*f));
+}
+
+static void proc_free_locked(struct proc *p)
+{
+    MAGIC_CHECK(p, PROC_MAGIC);
+    DEBUG_ASSERT(p->state == PROC_STATE_ZOMBIE ||
+                 p->state == PROC_STATE_EMBRYO);
+
+    proc_free_user_pages(p);
+
+    u64 fd_flags = proc_fd_lock_irqsave(p);
+    for (i32 i = 0; i < PROC_FD_MAX; i++)
+        proc_close_fd_impl(p, i);
+    proc_fd_unlock_irqrestore(p, fd_flags);
+
+    p->n_vmas = 0;
+    p->generation++;
+    p->magic = 0xDEADDEADU; /* poison for use-after-free detection */
+    p->state = PROC_STATE_FREE;
+}
+
+void proc_init(void)
+{
+    memset(proc_table, 0, sizeof(proc_table));
+    proc_table_lock = (spinlock_t) SPINLOCK_INITIALIZER;
+    next_pid = 1;
+    for (sz i = 0; i < PROC_MAX; i++)
+        init_waitqueue_head(&child_wqs[i]);
+}
+
+void proc_set_state(struct proc *p, enum proc_state new_state)
+{
+    assert(p);
+    MAGIC_CHECK(p, PROC_MAGIC);
+#if __DEBUG__
+    /* Valid state transitions encoded as a bitmask per source state. */
+    static const u8 valid_transitions[] = {
+        [PROC_STATE_FREE] = BIT(PROC_STATE_EMBRYO),
+        [PROC_STATE_EMBRYO] = BIT(PROC_STATE_RUNNING) | BIT(PROC_STATE_FREE),
+        [PROC_STATE_RUNNING] = BIT(PROC_STATE_SLEEPING) |
+                               BIT(PROC_STATE_STOPPED) | BIT(PROC_STATE_ZOMBIE),
+        [PROC_STATE_SLEEPING] =
+            BIT(PROC_STATE_RUNNING) | BIT(PROC_STATE_ZOMBIE),
+        [PROC_STATE_STOPPED] = BIT(PROC_STATE_RUNNING) | BIT(PROC_STATE_ZOMBIE),
+        [PROC_STATE_ZOMBIE] = BIT(PROC_STATE_FREE),
+    };
+    DEBUG_ASSERT(valid_transitions[p->state] & BIT(new_state));
+#endif
+    p->state = new_state;
+}
+
+struct proc *proc_alloc(void)
+{
+    u64 flags = proc_table_lock_irqsave();
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state == PROC_STATE_FREE) {
+            struct proc *p = &proc_table[i];
+            u32 gen = p->generation;
+            u16 pid = proc_alloc_pid_locked();
+            if (pid == 0) {
+                proc_table_unlock_irqrestore(flags);
+                return NULL;
+            }
+            memset(p, 0, sizeof(*p));
+            p->generation = gen;
+            p->magic = PROC_MAGIC;
+            p->pid = pid;
+            p->state = PROC_STATE_EMBRYO;
+            p->vma_cache_read = PROC_VMA_MAX;
+            p->vma_cache_write = PROC_VMA_MAX;
+            p->watchdog_heartbeat_ms = time_current_ms().ms;
+            p->fd_lock = (spinlock_t) SPINLOCK_INITIALIZER;
+            p->sig_lock = (spinlock_t) SPINLOCK_INITIALIZER;
+            p->fd_table[PROC_FD_STDIN].is_open = true;
+            p->fd_table[PROC_FD_STDOUT].is_open = true;
+            p->fd_table[PROC_FD_STDERR].is_open = true;
+            p->cwd[0] = '/';
+            p->cwd_len = 1;
+            /* Assign per-process VA window based on table slot index.
+             * Each slot gets PROC_SLOT_SIZE bytes of virtual address
+             * space so concurrent processes never overlap.
+             */
+            p->va_code_base = (vaddr_t) (USER_CODE_BASE + i * PROC_SLOT_SIZE);
+            p->va_stack_top =
+                (vaddr_t) (USER_CODE_BASE + (i + 1) * PROC_SLOT_SIZE);
+            /* Re-initialize the child wait queue for this slot.
+             * Ensures a clean list head regardless of prior state.
+             */
+            init_waitqueue_head(&child_wqs[i]);
+            proc_table_unlock_irqrestore(flags);
+            return p;
+        }
+    }
+    proc_table_unlock_irqrestore(flags);
+    return NULL;
+}
+
+void proc_close_fd_locked(struct proc *p, i32 fd)
+{
+    assert(p);
+    assert(fd >= 0 && fd < PROC_FD_MAX);
+    proc_close_fd_impl(p, fd);
+}
+
+void proc_close_fd(struct proc *p, i32 fd)
+{
+    u64 flags = proc_fd_lock_irqsave(p);
+    proc_close_fd_impl(p, fd);
+    proc_fd_unlock_irqrestore(p, flags);
+}
+
+void proc_free(struct proc *p)
+{
+    assert(p);
+    u64 flags = proc_table_lock_irqsave();
+    proc_free_locked(p);
+    proc_table_unlock_irqrestore(flags);
+}
+
+struct proc *proc_find_locked(u16 pid)
+{
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE && proc_table[i].pid == pid)
+            return &proc_table[i];
+    }
+    return NULL;
+}
+
+struct proc *proc_find(u16 pid)
+{
+    u64 flags = proc_table_lock_irqsave();
+    struct proc *p = proc_find_locked(pid);
+    proc_table_unlock_irqrestore(flags);
+    return p;
+}
+
+void proc_for_each(proc_iter_cb_t cb, void *ctx)
+{
+    u64 flags = proc_table_lock_irqsave();
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE)
+            cb(&proc_table[i], ctx);
+    }
+    proc_table_unlock_irqrestore(flags);
+}
+
+static bool has_zombie_child_locked(struct proc *parent)
+{
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state == PROC_STATE_ZOMBIE &&
+            proc_table[i].parent_pid == parent->pid)
+            return true;
+    }
+    return false;
+}
+
+/* Check if parent has any non-FREE child (any state including ZOMBIE). */
+static bool has_any_child_locked(struct proc *parent)
+{
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (i == proc_slot(parent))
+            continue;
+        if (proc_table[i].state != PROC_STATE_FREE &&
+            proc_table[i].parent_pid == parent->pid)
+            return true;
+    }
+    return false;
+}
+
+static bool proc_child_wait_ready(struct proc *parent)
+{
+    u64 flags = proc_table_lock_irqsave();
+    bool ready =
+        has_zombie_child_locked(parent) || !has_any_child_locked(parent);
+    proc_table_unlock_irqrestore(flags);
+    return ready;
+}
+
+void proc_notify_parent(struct proc *child)
+{
+    assert(child);
+    sz wake_slot = PROC_MAX; /* sentinel: no slot found */
+    u64 flags = proc_table_lock_irqsave();
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE &&
+            proc_table[i].pid == child->parent_pid) {
+            wake_slot = i;
+            break;
+        }
+    }
+    proc_table_unlock_irqrestore(flags);
+
+    if (wake_slot < PROC_MAX)
+        wake_up(&child_wqs[wake_slot], 1);
+}
+
+i32 proc_wait_child(struct proc *parent, u16 *out_pid, i32 *out_code)
+{
+    assert(parent);
+
+    /* Fast path: check for existing zombie or no children at all. */
+    u64 flags = proc_table_lock_irqsave();
+    bool has_zombie = has_zombie_child_locked(parent);
+    bool has_any = has_any_child_locked(parent);
+    proc_table_unlock_irqrestore(flags);
+    if (!has_zombie && !has_any)
+        return -(i32) ECHILD;
+
+    /* Block until a child becomes zombie. */
+    wait_event(child_wqs[proc_slot(parent)], proc_child_wait_ready(parent));
+
+    /* Find and reap the first zombie child. */
+    flags = proc_table_lock_irqsave();
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state == PROC_STATE_ZOMBIE &&
+            proc_table[i].parent_pid == parent->pid) {
+            *out_pid = proc_table[i].pid;
+            *out_code = proc_table[i].exit_code;
+            proc_free_locked(&proc_table[i]);
+            proc_table_unlock_irqrestore(flags);
+            return 0;
+        }
+    }
+    proc_table_unlock_irqrestore(flags);
+    return -(i32) ECHILD;
+}
+
+struct result proc_map_user_page(struct proc *p, vaddr_t vaddr, u16 perms)
+{
+    assert(p);
+    if (p->n_user_pages >= PROC_PAGES_MAX)
+        return result_error(ENOMEM);
+
+    struct option_byte_array ba = kvalloc_alloc(PAGE_SIZE, PAGE_SIZE);
+    if (ba.is_none)
+        return result_error(ENOMEM);
+    struct byte_array page_ba = option_byte_array_checked(ba);
+    void *page = page_ba.dat;
+
+    memset(page, 0, PAGE_SIZE);
+
+    struct result_paddr_t pa_res = virt_to_phys((vaddr_t) page);
+    if (pa_res.is_error) {
+        kvalloc_free(page_ba);
+        return result_error(pa_res.code);
+    }
+    paddr_t pa = result_paddr_t_checked(pa_res);
+
+    paging_map_page(vaddr, pa, perms);
+
+    p->user_pages[p->n_user_pages].paddr = pa;
+    p->user_pages[p->n_user_pages].vaddr = vaddr;
+    p->n_user_pages++;
+
+    return result_ok();
+}
+
+void proc_free_user_pages(struct proc *p)
+{
+    assert(p);
+    for (sz i = 0; i < p->n_user_pages; i++) {
+        paging_unmap_page(p->user_pages[i].vaddr);
+        /* Convert paddr back to vaddr for kvalloc_free (identity-mapped). */
+        struct result_vaddr_t va = phys_to_virt(p->user_pages[i].paddr);
+        if (!va.is_error) {
+            vaddr_t kva = result_vaddr_t_checked(va);
+            kvalloc_free(byte_array_new((byte *) kva, PAGE_SIZE));
+        }
+    }
+    p->n_user_pages = 0;
+}
+
+bool proc_is_missing_or_zombie(u16 pid)
+{
+    bool result = true;
+    u64 flags = proc_table_lock_irqsave();
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE &&
+            proc_table[i].pid == pid) {
+            result = proc_table[i].state == PROC_STATE_ZOMBIE;
+            break;
+        }
+    }
+    proc_table_unlock_irqrestore(flags);
+    return result;
+}
+
+i32 proc_add_vma(struct proc *p, vaddr_t base, sz len, u16 perms)
+{
+    assert(p);
+    if (len == 0)
+        return -(i32) EINVAL;
+    if ((uptr) base + (uptr) len < (uptr) base)
+        return -(i32) EINVAL;
+    if (p->n_vmas >= PROC_VMA_MAX)
+        return -(i32) ENOMEM;
+    struct vma *v = &p->vmas[p->n_vmas++];
+    v->base = base;
+    v->len = len;
+    v->perms = perms;
+    v->active = true;
+    return 0;
+}
+
+bool proc_vma_contains(struct proc *p, ptr addr, sz len)
+{
+    return proc_vma_check_access(p, addr, len, 0);
+}
+
+bool proc_vma_check_access(struct proc *p, ptr addr, sz len, u16 required_perms)
+{
+    if (!p)
+        return false;
+    if (len == 0)
+        return true; /* zero-length access is always valid */
+
+    uptr uaddr = (uptr) addr;
+    uptr uend = uaddr + (uptr) len;
+    if (uend < uaddr)
+        return false; /* overflow */
+
+    u8 *cache = NULL;
+    if (required_perms & VMA_PERM_WRITE)
+        cache = &p->vma_cache_write;
+    else
+        cache = &p->vma_cache_read;
+
+    if (*cache < p->n_vmas) {
+        struct vma *v = &p->vmas[*cache];
+        if (v->active) {
+            uptr vbase = (uptr) v->base;
+            uptr vend = vbase + (uptr) v->len;
+            if (uaddr >= vbase && uend <= vend) {
+                if (!required_perms ||
+                    (v->perms & required_perms) == required_perms)
+                    return true;
+                return false;
+            }
+        }
+    }
+
+    for (sz i = 0; i < p->n_vmas; i++) {
+        struct vma *v = &p->vmas[i];
+        if (!v->active)
+            continue;
+        uptr vbase = (uptr) v->base;
+        uptr vend = vbase + (uptr) v->len;
+        if (uaddr >= vbase && uend <= vend) {
+            if (required_perms && (v->perms & required_perms) != required_perms)
+                return false;
+            *cache = (u8) i;
+            return true;
+        }
+    }
+
+    *cache = PROC_VMA_MAX;
+    return false;
+}
+
+void proc_reparent_children(struct proc *parent)
+{
+    assert(parent);
+    bool need_wake_init = false;
+    sz init_slot = PROC_MAX;
+
+    u64 flags = proc_table_lock_irqsave();
+
+    /* Find PID 1 (init).  If init is missing or zombie, orphaned zombie
+     * children will be auto-reaped below.
+     */
+    struct proc *init = NULL;
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE && proc_table[i].pid == 1) {
+            init = &proc_table[i];
+            init_slot = i;
+            break;
+        }
+    }
+    bool init_alive = init && init->state != PROC_STATE_ZOMBIE;
+
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state == PROC_STATE_FREE)
+            continue;
+        if (proc_table[i].parent_pid != parent->pid)
+            continue;
+        if (&proc_table[i] == parent)
+            continue;
+
+        if (init_alive) {
+            proc_table[i].parent_pid = 1;
+            if (proc_table[i].state == PROC_STATE_ZOMBIE)
+                need_wake_init = true;
+        } else {
+            /* No init: auto-reap zombie children. */
+            if (proc_table[i].state == PROC_STATE_ZOMBIE)
+                proc_free_locked(&proc_table[i]);
+            else
+                proc_table[i].parent_pid = 0; /* true orphan */
+        }
+    }
+    proc_table_unlock_irqrestore(flags);
+
+    /* Deferred wake: notify init's child wait queue if zombies were
+     * reparented.  Done outside proc_table_lock for lock ordering.
+     */
+    if (need_wake_init && init_slot < PROC_MAX)
+        wake_up(&child_wqs[init_slot], 1);
+}
+
+void proc_exit(struct proc *p, i32 exit_code)
+{
+    assert(p);
+    MAGIC_CHECK(p, PROC_MAGIC);
+
+    p->exit_code = exit_code;
+
+    /* Walk the robust futex list to unlock orphaned futexes before
+     * tearing down the process.  Must happen while the task link and
+     * user pages are still valid (before detach and free).
+     */
+    futex_exit_robust_list(p);
+
+    /* Tear down armed POSIX timers before detaching the task link.
+     * Prevents the timer expiry callback from signaling a dead process.
+     */
+    posix_timer_teardown_proc(p);
+
+    /* Release sync handles owned by this process. */
+    sync_handle_teardown_proc(p);
+
+    /* Reparent children before going zombie. */
+    proc_reparent_children(p);
+
+    /* Determine parent status, detach task link, and transition to ZOMBIE
+     * under a single lock hold to avoid TOCTOU and data races.
+     */
+    sz parent_slot = PROC_MAX;
+    u64 flags = proc_table_lock_irqsave();
+
+    /* Detach task link under lock so no other CPU reads stale pointers. */
+    if (p->task) {
+        p->task->proc = NULL;
+        p->task = NULL;
+    }
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE &&
+            proc_table[i].state != PROC_STATE_ZOMBIE &&
+            proc_table[i].pid == p->parent_pid) {
+            parent_slot = i;
+            break;
+        }
+    }
+
+    proc_set_state(p, PROC_STATE_ZOMBIE);
+
+    if (parent_slot == PROC_MAX)
+        proc_free_locked(p); /* orphan: auto-reap immediately */
+    proc_table_unlock_irqrestore(flags);
+
+    /* Wake parent outside the lock to respect lock ordering. */
+    if (parent_slot < PROC_MAX)
+        wake_up(&child_wqs[parent_slot], 1);
+}
+
+sz proc_count_children(u16 parent_pid)
+{
+    sz count = 0;
+    u64 flags = proc_table_lock_irqsave();
+    for (sz i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].state != PROC_STATE_FREE &&
+            proc_table[i].pid != parent_pid &&
+            proc_table[i].parent_pid == parent_pid)
+            count++;
+    }
+    proc_table_unlock_irqrestore(flags);
+    return count;
+}
+
+#include __INC_TEST(proc)

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Git prepare-commit-msg hook for Mazu RTOS.
+# Injects commit message guidelines into the editor template for interactive
+# commits only (no -m, no amend, no merge).
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="${2:-}"
+
+# Only fire for interactive commits (editor opens with no pre-filled message).
+if [ -n "$COMMIT_SOURCE" ]; then
+    exit 0
+fi
+
+# Don't overwrite a message that already has non-comment content.
+if grep -qE '^[^#]' "$COMMIT_MSG_FILE" 2>/dev/null; then
+    exit 0
+fi
+
+# List staged files for context.
+staged_list="$(git diff --cached --name-only --diff-filter=ACM | sed 's/^/#   /')"
+
+cat > "$COMMIT_MSG_FILE" <<EOF
+# Commit message rules (enforced by commit-msg hook):
+#  1. Separate subject from body with a blank line
+#  2. Limit the subject line to 50 characters (72 hard max)
+#  3. Capitalize the subject line
+#  4. Do not end the subject line with a period
+#  5. Use the imperative mood (e.g. "Fix", not "Fixed")
+#  6. Wrap the body at 72 characters
+#  7. Use the body to explain what and why, not how
+#
+# Staged files:
+${staged_list}
+EOF
+
+exit 0

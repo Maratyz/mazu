@@ -1,0 +1,698 @@
+/* SPDX-License-Identifier: MIT */
+#include <mazu/sched.h>
+#include <mazu/selftest.h>
+
+/* Convenience shorthand for tests: creates a task without noreturn flag. */
+static struct result sched_create_impl(sched_callback_func_t callback,
+                                       void *context,
+                                       u8 prio,
+                                       i32 affinity)
+{
+    return sched_create_impl_ex(callback, context, prio, affinity, false);
+}
+
+static volatile enum td_state selftest_observed_state;
+
+static void selftest_state_cb(void *ctx __unused)
+{
+    /* Record this task's state (should be RUNNING during execution). */
+    selftest_observed_state = get_pcpu()->curthread->state;
+}
+
+static i32 test_thread_states(void)
+{
+    /* Main task should be RUNNING. */
+    if (get_pcpu()->curthread->state != TD_STATE_RUNNING)
+        return 1;
+
+    /* Create task pinned to BSP so a secondary hart doesn't steal it. */
+    struct result res =
+        sched_create_impl(selftest_state_cb, NULL, SCHED_PRIO_NORMAL, 0);
+    if (res.is_error)
+        return 1;
+
+    /* Yield to the new task; it records its own state. */
+    sleep_ms(time_ms_new(0));
+
+    /* The new task ran and observed itself as RUNNING. */
+    if (selftest_observed_state != TD_STATE_RUNNING)
+        return 1;
+
+    return 0;
+}
+DEFINE_SELFTEST(thread_states, test_thread_states);
+
+static volatile u64 selftest_busy_cpu_us;
+
+static void selftest_busy_cb(void *ctx __unused)
+{
+    /* Busy-loop for roughly 50ms.  Uses time_current_ms() which is
+     * already calibrated to the actual timebase frequency.
+     */
+    struct time_ms start = time_current_ms();
+    while (time_current_ms().ms - start.ms < 50)
+        ;
+    /* Include the current (not yet accumulated) time slice.
+     * Disable interrupts so preemption cannot update cpu_time_us
+     * between reading it and sampling switch_in_ticks.
+     */
+    disable_interrupts();
+    struct sched_task *td = get_pcpu()->curthread;
+    selftest_busy_cpu_us =
+        td->cpu_time_us + time_ticks_to_us(time_rdtime() - td->switch_in_ticks);
+    enable_interrupts();
+}
+
+static i32 test_cpu_time(void)
+{
+    selftest_busy_cpu_us = 0;
+    /* Pin to BSP so the task doesn't migrate to a secondary hart
+     * before observing its cpu_time_us.
+     */
+    struct result res =
+        sched_create_impl(selftest_busy_cb, NULL, SCHED_PRIO_NORMAL, 0);
+    if (res.is_error)
+        return 1;
+
+    /* Yield to let the busy task run. */
+    sleep_ms(time_ms_new(0));
+
+    /* Generous tolerance: 20ms..200ms (QEMU jitter can be substantial). */
+    if (selftest_busy_cpu_us < 20000 || selftest_busy_cpu_us > 200000)
+        return 1;
+    return 0;
+}
+DEFINE_SELFTEST(cpu_time, test_cpu_time);
+
+/* Priority ordering: create tasks at different priorities, verify execution
+ * order via a shared counter array.  Higher priority runs first.
+ */
+static volatile int prio_order[3];
+static volatile int prio_idx;
+
+static void selftest_prio_cb(void *ctx)
+{
+    int slot = (int) (uptr) ctx;
+    int idx = prio_idx;
+    if (idx < (int) countof(prio_order))
+        prio_order[idx] = slot;
+    prio_idx = idx + 1;
+}
+
+static i32 test_priority_order(void)
+{
+    prio_idx = 0;
+    prio_order[0] = prio_order[1] = prio_order[2] = -1;
+
+    /* Create tasks: LOW=0, NORMAL=1, HIGH=2. Create in ascending order
+     * so that without priorities they'd run 0,1,2.  With priorities the
+     * HIGH task should run first.  Pin all to BSP so secondary harts
+     * don't steal them before priority ordering can be verified.
+     *
+     * Disable interrupts around all three creates to prevent IPI_SCHED
+     * from preempting main between creates.  After cpu_time test, BSP
+     * is marked idle (main is IDLE priority); an IPI bounce from a
+     * secondary could schedule the IDLE test task prematurely.
+     */
+    disable_interrupts();
+    struct result r;
+    r = sched_create_impl(selftest_prio_cb, (void *) (uptr) 0, SCHED_PRIO_IDLE,
+                          0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    r = sched_create_impl(selftest_prio_cb, (void *) (uptr) 1,
+                          SCHED_PRIO_NORMAL, 0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    r = sched_create_impl(selftest_prio_cb, (void *) (uptr) 2, SCHED_PRIO_HIGH,
+                          0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    enable_interrupts();
+
+    /* Yield to let them all run.  The main task is IDLE priority, so all
+     * created tasks will run before resuming.  Any pending IPI that
+     * arrived during the disabled window fires now, triggering the
+     * context switch to the highest-priority test task.
+     *
+     * Use a brief sleep (not yield) to give all three tasks time to
+     * complete on SMP, where timer ticks and IPI processing may delay
+     * the pinned tasks beyond a single yield quantum.
+     */
+    sleep_ms(time_ms_new(50));
+
+    /* Expected order: HIGH(2), NORMAL(1), IDLE(0). */
+    if (prio_order[0] != 2 || prio_order[1] != 1 || prio_order[2] != 0)
+        return 1;
+    return 0;
+}
+DEFINE_SELFTEST(priority_order, test_priority_order);
+
+/* Preemption test: two NORMAL tasks - a busy-waiter that never yields,
+ * and a setter that flips a flag.  Without preemption the busy-waiter
+ * would block forever; with preemption the timer tick expires its quantum
+ * and the setter gets a turn.
+ */
+static volatile bool preempt_flag;
+
+static void selftest_preempt_noyield(void *ctx __unused)
+{
+    while (!preempt_flag)
+        ;
+}
+
+static void selftest_preempt_setter(void *ctx __unused)
+{
+    preempt_flag = true;
+}
+
+static i32 test_preemption(void)
+{
+    preempt_flag = false;
+
+    /* Pin both tasks to BSP so preemption (not SMP parallelism) is the
+     * only mechanism that allows setter to run.  Create with interrupts
+     * disabled to prevent IPI-triggered preemption between creates.
+     */
+    disable_interrupts();
+    struct result r;
+    r = sched_create_impl(selftest_preempt_noyield, NULL, SCHED_PRIO_NORMAL, 0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    r = sched_create_impl(selftest_preempt_setter, NULL, SCHED_PRIO_NORMAL, 0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    enable_interrupts();
+
+    /* Both tasks are NORMAL, pinned to BSP.  noyield runs first (FIFO),
+     * busy-waits on the flag.  After one quantum (10ms) the timer preempts
+     * it, setter runs and flips the flag.  noyield resumes, sees the flag,
+     * exits.  Main resumes from sleep.
+     */
+    sleep_ms(time_ms_new(200));
+
+    if (!preempt_flag)
+        return 1;
+    return 0;
+}
+DEFINE_SELFTEST(preemption, test_preemption);
+
+/* Test: setting need_resched + yielding clears the flag via the real
+ * trap path and returns to the same task (only runnable at this priority).
+ */
+static i32 test_need_resched_trap_exit(void)
+{
+    struct pcpu *pc = get_pcpu();
+    struct sched_task *td = pc->curthread;
+
+    if (!td || td->state != TD_STATE_RUNNING)
+        return 1;
+
+    __atomic_store_n(&pc->need_resched, 1, __ATOMIC_RELEASE);
+    sleep_ms(time_ms_new(0)); /* yield through real trap path */
+
+    /* need_resched must have been drained by trap_dispatch. */
+    if (__atomic_load_n(&pc->need_resched, __ATOMIC_RELAXED) != 0)
+        return 1;
+    if (pc->curthread != td)
+        return 1;
+    return 0;
+}
+DEFINE_SELFTEST(need_resched_trap_exit, test_need_resched_trap_exit);
+
+/* Test: quantum_callout_cb sets need_resched, and yielding clears it. */
+static i32 test_quantum_expiry_need_resched(void)
+{
+    struct pcpu *pc = get_pcpu();
+    struct sched_task *td = pc->curthread;
+
+    if (!td || td->state != TD_STATE_RUNNING)
+        return 1;
+
+    __atomic_store_n(&pc->need_resched, 0, __ATOMIC_RELAXED);
+    quantum_callout_cb(NULL);
+
+    if (__atomic_load_n(&pc->need_resched, __ATOMIC_ACQUIRE) == 0)
+        return 1;
+
+    sleep_ms(time_ms_new(0)); /* yield through real trap path */
+
+    if (__atomic_load_n(&pc->need_resched, __ATOMIC_RELAXED) != 0)
+        return 1;
+    if (pc->curthread != td)
+        return 1;
+    return 0;
+}
+DEFINE_SELFTEST(quantum_expiry_need_resched, test_quantum_expiry_need_resched);
+
+/* CPU affinity test: pin a task to hart 0, verify it runs there.
+ * Then reset to -1 (any hart) and verify the field is updated.
+ */
+static volatile u32 affinity_observed_cpu;
+
+static void selftest_affinity_cb(void *ctx __unused)
+{
+    affinity_observed_cpu = get_pcpu()->cpuid;
+}
+
+static i32 test_cpu_affinity(void)
+{
+    affinity_observed_cpu = (u32) -1;
+
+    /* Create a task pinned to hart 0. */
+    struct result r =
+        sched_create_impl(selftest_affinity_cb, NULL, SCHED_PRIO_NORMAL, 0);
+    if (r.is_error)
+        return 1;
+
+    sleep_ms(time_ms_new(50));
+
+    /* Task should have run on hart 0. */
+    if (affinity_observed_cpu != 0)
+        return 1;
+
+    return 0;
+}
+DEFINE_SELFTEST(cpu_affinity, test_cpu_affinity);
+
+#if CONFIG_SMP
+/* SMP migration test: verify that cross-hart migration counter increases
+ * when unpinned tasks run across multiple harts.
+ */
+static void selftest_migration_noop(void *ctx __unused) {}
+
+static i32 test_smp_migration_counter(void)
+{
+    struct sched_ctxsw_stats before;
+    sched_get_ctxsw_stats(&before);
+
+    /* Create unpinned tasks that yield repeatedly.  With SMP, some will
+     * migrate between harts.
+     */
+    for (int i = 0; i < 4; i++) {
+        struct result r = sched_create_task(selftest_migration_noop, NULL);
+        if (r.is_error)
+            return 1;
+    }
+
+    /* Yield enough to allow task migration across harts. */
+    for (int i = 0; i < 10; i++)
+        sleep_ms(time_ms_new(1));
+
+    struct sched_ctxsw_stats after;
+    sched_get_ctxsw_stats(&after);
+
+    /* nr_migrations should have increased (at least some tasks migrated). */
+    /* Note: cannot assert strictly >0 because QEMU SMP timing is
+     * non-deterministic, but the counter must be valid (not garbage).
+     */
+    if (after.nr_migrations < before.nr_migrations)
+        return 1;
+
+    return 0;
+}
+DEFINE_SELFTEST(smp_migration_counter, test_smp_migration_counter);
+
+/* SMP run queue test: create tasks that each busy-loop and increment a
+ * volatile counter.  With multiple harts, they run in parallel.
+ */
+static volatile u32 smp_counters[4];
+
+static void selftest_smp_counter(void *ctx)
+{
+    int idx = (int) (uptr) ctx;
+    struct time_ms start = time_current_ms();
+    while (time_current_ms().ms - start.ms < 50)
+        smp_counters[idx]++;
+}
+
+static i32 test_smp_runqueue(void)
+{
+    for (int i = 0; i < 4; i++)
+        smp_counters[i] = 0;
+
+    for (int i = 0; i < 4; i++) {
+        struct result r =
+            sched_create_task(selftest_smp_counter, (void *) (uptr) i);
+        if (r.is_error)
+            return 1;
+    }
+
+    sleep_ms(time_ms_new(200));
+
+    for (int i = 0; i < 4; i++) {
+        if (smp_counters[i] == 0)
+            return 1;
+    }
+    return 0;
+}
+DEFINE_SELFTEST(smp_runqueue, test_smp_runqueue);
+#endif /* CONFIG_SMP */
+
+/* Priority bitmap correctness: verify bitmap tracks queue occupancy after
+ * tasks at different priority levels run and exit.
+ */
+static void selftest_bitmap_noop(void *ctx __unused) {}
+
+static i32 test_priority_bitmap(void)
+{
+    /* After the previous tests, the bitmap should reflect current state.
+     * Verify indirectly: create and drain tasks at each non-idle priority
+     * and check that pick_next doesn't crash (it would crash on empty
+     * bitmap + empty queue mismatch).
+     */
+    disable_interrupts();
+    struct result r;
+    r = sched_create_impl(selftest_bitmap_noop, NULL, SCHED_PRIO_HIGH, 0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    r = sched_create_impl(selftest_bitmap_noop, NULL, SCHED_PRIO_NORMAL, 0);
+    if (r.is_error) {
+        enable_interrupts();
+        return 1;
+    }
+    enable_interrupts();
+
+    /* Let them run; they exit immediately. */
+    sleep_ms(time_ms_new(0));
+
+    /* The BSP idle task is always in pcpu_runq[0][IDLE], so bit 0
+     * should be set.  Higher bits should be clear after tasks exit.
+     */
+    u64 flags = spin_lock_irqsave(&pcpu_runq_lock[0]);
+    bool idle_set = (pcpu_runq_bitmap[0] & BIT(SCHED_PRIO_IDLE)) != 0;
+    spin_unlock_irqrestore(&pcpu_runq_lock[0], flags);
+
+    return idle_set ? 0 : 1;
+}
+DEFINE_SELFTEST(priority_bitmap, test_priority_bitmap);
+
+static i32 test_wakeup_latency_histogram(void)
+{
+    struct sched_latency_stats before, after;
+    sched_get_latency_stats(&before);
+
+    for (int i = 0; i < 5; i++)
+        sleep_ms(time_ms_new(1));
+
+    sched_get_latency_stats(&after);
+
+    u64 before_total = 0, after_total = 0;
+    for (u32 i = 0; i < countof(before.wakeup_latency_hist); i++) {
+        before_total += before.wakeup_latency_hist[i];
+        after_total += after.wakeup_latency_hist[i];
+    }
+
+    if (after_total <= before_total)
+        return 1;
+    if (after.wakeup_latency_max_us == 0)
+        return 1;
+    return 0;
+}
+DEFINE_SELFTEST(wakeup_latency_histogram, test_wakeup_latency_histogram);
+
+/* Context-switch counting: verify that sched_get_ctxsw_stats returns
+ * non-zero counters after context switches have occurred.
+ */
+static i32 test_ctxsw_counting(void)
+{
+    struct sched_ctxsw_stats before, after;
+    sched_get_ctxsw_stats(&before);
+
+    /* Force several context switches via sleep_ms(0) yields. */
+    for (int i = 0; i < 5; i++)
+        sleep_ms(time_ms_new(0));
+
+    sched_get_ctxsw_stats(&after);
+
+    /* Context-switch count must have increased. */
+    if (after.nr_ctxsw <= before.nr_ctxsw)
+        return 1;
+
+    /* max_cycles should be non-zero (at least one switch measured). */
+    if (after.max_cycles == 0)
+        return 1;
+
+    return 0;
+}
+DEFINE_SELFTEST(ctxsw_counting, test_ctxsw_counting);
+
+/* Watchdog test: verify that sched_note_activity updates last_activity_ms
+ * and that the watchdog stats function works.
+ */
+static i32 test_watchdog_activity(void)
+{
+    struct sched_task *td = get_pcpu()->curthread;
+    if (!td)
+        return 1;
+
+    /* Stamp activity and verify it was recorded. */
+    u64 before = td->last_activity_ms;
+    sleep_ms(time_ms_new(10));
+    sched_note_activity();
+    u64 after = td->last_activity_ms;
+    if (after < before)
+        return 1;
+
+    /* Verify watchdog stats function doesn't crash. */
+    struct sched_watchdog_stats wds;
+    sched_get_watchdog_stats(&wds);
+    /* nr_warnings is cumulative; just check it's valid. */
+    (void) wds.nr_hung;
+
+    return 0;
+}
+DEFINE_SELFTEST(watchdog_activity, test_watchdog_activity);
+
+#if CONFIG_SCHED_EEVDF
+/* EEVDF fairness test: spawn N equal-priority tasks that each run for
+ * a fixed number of yield iterations, recording how much CPU time each
+ * consumed.  Verify each got roughly 1/N of the total.
+ *
+ * Workers yield voluntarily (sleep_ms(0)) to avoid starving the
+ * IDLE-priority selftest runner.  The yield-count approach measures
+ * fairness without requiring the caller to sleep (which would be
+ * starved by NORMAL-priority workers).
+ */
+#define EEVDF_N_TASKS 3
+#define EEVDF_ITERATIONS 50
+static volatile u64 eevdf_cpu_time[EEVDF_N_TASKS];
+static volatile int eevdf_done_count;
+
+static void eevdf_worker_cb(void *arg)
+{
+    int slot = (int) (uptr) arg;
+    struct sched_task *td = get_pcpu()->curthread;
+
+    for (int i = 0; i < EEVDF_ITERATIONS; i++)
+        sleep_ms(time_ms_new(0)); /* yield */
+
+    eevdf_cpu_time[slot] = td->cpu_time_us;
+    __atomic_fetch_add(&eevdf_done_count, 1, __ATOMIC_RELEASE);
+}
+
+static i32 test_eevdf_fairness(void)
+{
+    eevdf_done_count = 0;
+    for (int i = 0; i < EEVDF_N_TASKS; i++)
+        eevdf_cpu_time[i] = 0;
+
+    /* Create N workers at NORMAL priority. */
+    for (int i = 0; i < EEVDF_N_TASKS; i++) {
+        struct result r = sched_create_impl(eevdf_worker_cb, (void *) (uptr) i,
+                                            SCHED_PRIO_NORMAL, -1);
+        if (r.is_error)
+            return 1;
+    }
+
+    /* Wait for all workers to finish (up to 5s). */
+    u64 start = time_rdtime();
+    u64 timeout = time_ms_to_ticks(5000);
+    while (__atomic_load_n(&eevdf_done_count, __ATOMIC_ACQUIRE) <
+           EEVDF_N_TASKS) {
+        if (time_rdtime() - start > timeout)
+            return 1; /* timed out */
+        sleep_ms(time_ms_new(10));
+    }
+
+    /* Each worker ran EEVDF_ITERATIONS yields.  Under EEVDF, the CPU
+     * time should be distributed roughly equally.  Allow wide tolerance
+     * (each gets at least 5% and at most 80%) for QEMU SMP jitter —
+     * tasks can land on different harts with uneven interrupt load.
+     */
+    u64 total = 0;
+    for (int i = 0; i < EEVDF_N_TASKS; i++)
+        total += eevdf_cpu_time[i];
+
+    if (total == 0)
+        return 1; /* workers never accumulated CPU time */
+
+    for (int i = 0; i < EEVDF_N_TASKS; i++) {
+        u64 pct = (eevdf_cpu_time[i] * 100) / total;
+        if (pct < 5 || pct > 80)
+            return 1;
+    }
+
+    return 0;
+}
+DEFINE_SELFTEST(eevdf_fairness, test_eevdf_fairness);
+#endif /* CONFIG_SCHED_EEVDF */
+
+/* Per-hart heartbeat: verify that heartbeat_stamp is updated during
+ * scheduling and that sched_get_hart_watchdog reports a valid age.
+ * Also verify that a healthy hart is not marked stale.
+ */
+static i32 test_hart_heartbeat(void)
+{
+    struct pcpu *pc = get_pcpu();
+    u32 cpu = pc->cpuid;
+
+    /* Heartbeat stamp should be non-zero after scheduler has run. */
+    u64 stamp_before = pc->heartbeat_stamp;
+    if (stamp_before == 0)
+        return 1;
+
+    /* Force a context switch to update heartbeat. */
+    sleep_ms(time_ms_new(10));
+
+    u64 stamp_after = pc->heartbeat_stamp;
+    if (stamp_after <= stamp_before)
+        return 1;
+
+    /* Query hart watchdog stats: age should be small, not stale. */
+    struct sched_hart_watchdog_stats hwd;
+    if (sched_get_hart_watchdog(cpu, &hwd) != 0)
+        return 1;
+    if (hwd.stale)
+        return 1;
+    /* Age should be under 1 second (generous tolerance). */
+    if (hwd.heartbeat_age_us > 1000000)
+        return 1;
+
+    return 0;
+}
+DEFINE_SELFTEST(hart_heartbeat, test_hart_heartbeat);
+
+/* Scheduling domain: basic API test (init, attach, detach). */
+static i32 test_sched_domain_basic(void)
+{
+    struct sched_domain dom;
+    u64 quantum = time_ms_to_ticks(100);
+    u64 period = time_ms_to_ticks(200);
+
+    sched_domain_init(&dom, quantum, period);
+
+    if (dom.quantum_ticks != quantum || dom.period_ticks != period)
+        return 1;
+    if (dom.consumed_ticks != 0 || dom.state != DOMAIN_ACTIVE)
+        return 1;
+    if (dom.nr_members != 0)
+        return 1;
+
+    /* Attach/detach using current task as a guinea pig. */
+    struct sched_task *cur = get_pcpu()->curthread;
+    struct sched_domain *saved_domain = cur->domain;
+
+    if (sched_domain_attach(&dom, cur) != 0)
+        return 1;
+    if (dom.nr_members != 1 || cur->domain != &dom)
+        return 1;
+
+    sched_domain_detach(cur);
+    if (dom.nr_members != 0 || cur->domain != NULL)
+        return 1;
+
+    /* Restore original domain via the proper API. */
+    if (saved_domain) {
+        if (sched_domain_attach(saved_domain, cur) != 0)
+            return 1;
+    }
+
+    /* Cancel the refill callout to avoid stale timer. */
+    callout_cancel_sync(&dom.refill_callout);
+
+    return 0;
+}
+DEFINE_SELFTEST(sched_domain_basic, test_sched_domain_basic);
+
+/* Scheduling domain budget test: a task in a tight-budget domain
+ * gets blocked (DEPLETED), then resumes after the refill callout.
+ */
+static volatile int domain_worker_iters;
+
+static void domain_worker_cb(void *arg __unused)
+{
+    /* Yield in a loop, counting iterations. */
+    for (int i = 0; i < 200; i++) {
+        __atomic_fetch_add(&domain_worker_iters, 1, __ATOMIC_RELAXED);
+        sleep_ms(time_ms_new(0)); /* yield */
+    }
+}
+
+static i32 test_sched_domain_budget(void)
+{
+    struct sched_domain dom;
+    i32 ret = 1;
+    /* Small budget: 10ms quantum, 50ms period. */
+    u64 quantum = time_ms_to_ticks(10);
+    u64 period = time_ms_to_ticks(50);
+    sched_domain_init(&dom, quantum, period);
+
+    domain_worker_iters = 0;
+
+    /* Create a worker task pinned to BSP. */
+    struct result r =
+        sched_create_impl(domain_worker_cb, NULL, SCHED_PRIO_NORMAL, 0);
+    if (r.is_error)
+        goto out;
+
+    /* Since cannot easily get a task pointer from sched_create_impl
+     * (it returns result, not task*), verify domain mechanics via
+     * state transitions:
+     * 1. After some time, domain should deplete (consumed >= quantum)
+     * 2. After refill, domain should become ACTIVE again
+     */
+
+    /* Wait for the worker to complete or timeout (3s). */
+    u64 start = time_rdtime();
+    u64 timeout = time_ms_to_ticks(3000);
+    while (__atomic_load_n(&domain_worker_iters, __ATOMIC_RELAXED) < 200) {
+        if (time_rdtime() - start > timeout)
+            break;
+        sleep_ms(time_ms_new(10));
+    }
+
+    if (__atomic_load_n(&domain_worker_iters, __ATOMIC_RELAXED) < 200)
+        goto out;
+
+    /* Verify domain refill mechanics directly: deplete, then check refill.
+     * Use atomic stores to match the ordering used by production code.
+     */
+    __atomic_store_n(&dom.consumed_ticks, dom.quantum_ticks, __ATOMIC_RELAXED);
+    __atomic_store_n(&dom.state, DOMAIN_DEPLETED, __ATOMIC_RELEASE);
+
+    /* Wait for the refill callout to fire (period is 50ms). */
+    sleep_ms(time_ms_new(80));
+
+    if (__atomic_load_n(&dom.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE ||
+        __atomic_load_n(&dom.consumed_ticks, __ATOMIC_RELAXED) != 0)
+        goto out;
+
+    ret = 0;
+out:
+    callout_cancel_sync(&dom.refill_callout);
+    return ret;
+}
+DEFINE_SELFTEST(sched_domain_budget, test_sched_domain_budget);

@@ -1,0 +1,341 @@
+# Mazu Kernel Configuration
+
+mainmenu "Mazu Kernel Configuration"
+
+config CONFIGURED
+    bool
+    default y
+
+menu "Architecture"
+    choice
+        prompt "Target architecture"
+        default ARCH_RISCV64
+    config ARCH_RISCV64
+        bool "RISC-V 64-bit"
+    endchoice
+
+    config RISCV_MODE_S
+        bool "S-mode (supervisor) execution"
+        default y
+        depends on ARCH_RISCV64
+        help
+          Run in S-mode under OpenSBI (default and recommended).
+          All SMP, timer, and IPI code assumes SBI is available.
+endmenu
+
+menu "Scheduler"
+    config SCHED_PREEMPTIVE
+        bool
+        default y
+        depends on RISCV_MODE_S
+        help
+          Mazu is a hard-RT kernel: timer-driven kernel preemption is
+          mandatory and not exposed as a product option.
+
+    config SCHED_NPRIO
+        int "Number of priority levels"
+        default 4
+        range 2 16
+
+    config SCHED_EEVDF
+        bool "EEVDF fair scheduling within priority levels"
+        default y
+        depends on SCHED_PREEMPTIVE
+        help
+          Earliest Eligible Virtual Deadline First scheduling within
+          each priority level. Each task gets a virtual deadline based
+          on its time slice; eligible tasks (those that haven't consumed
+          more than their fair share) are scheduled by earliest deadline.
+          This bounds wake-to-run latency proportional to the slice,
+          preventing starvation among equal-priority tasks (e.g., many
+          web-handler tasks). Priority levels still dominate: higher-
+          priority tasks always preempt. Default bitmap is better for
+          deterministic RT workloads with few tasks.
+
+    config SCHED_DEADLINE
+        bool "SCHED_DEADLINE (EDF) scheduling policy"
+        default n
+        depends on SCHED_PREEMPTIVE
+        help
+          Earliest Deadline First scheduling for hard-RT tasks with
+          explicit deadline parameters (runtime, deadline, period).
+          Deadline tasks always preempt EEVDF/FIFO/RR tasks.
+          Admission control rejects task sets that exceed a
+          configurable utilization threshold.
+
+    config SCHED_DL_UTIL_THRESHOLD
+        int "Admission control utilization threshold (percent)"
+        default 95
+        range 50 100
+        depends on SCHED_DEADLINE
+
+    config MIXED_CRIT
+        bool "Mixed-criticality scheduling domains"
+        default n
+        depends on SCHED_PREEMPTIVE
+        help
+          Two criticality levels (HI/LO) for scheduling domains.
+          HI domains get guaranteed minimum bandwidth; LO domains
+          are suspended during escalation when HI tasks overrun.
+
+    config MIXED_CRIT_HI_PCT
+        int "HI domain guaranteed bandwidth (percent)"
+        default 70
+        range 50 95
+        depends on MIXED_CRIT
+
+    config SMP
+        bool "Symmetric multiprocessing"
+        default y
+        depends on ARCH_RISCV64
+        help
+          Boot and initialize multiple harts.  Secondaries park in
+          wfi until the scheduler is SMP-aware (Phase C).
+
+    config CPU_MAX
+        int "Maximum number of CPUs"
+        default 8
+        range 1 128
+        depends on SMP
+
+    config MEASURE_LATENCY
+        bool "Latency measurement profile"
+        default n
+        depends on SCHED_PREEMPTIVE
+        help
+          Mark this configuration as a latency measurement profile.
+          Core latency instrumentation (callout jitter histogram,
+          wakeup latency histogram, context-switch cycle counting)
+          is always compiled in — the overhead is a few counter
+          increments per timer interrupt and context switch.
+          This symbol serves as a profile marker for test scripts
+          and build validation (e.g., RT defconfigs that should
+          always have latency data available).
+
+    config UBSAN
+        bool "Undefined Behavior Sanitizer (trap mode)"
+        default n
+        help
+          GCC -fsanitize=undefined with -fsanitize-trap=all.
+          No runtime library needed. On undefined behavior the
+          compiler inserts ebreak which triggers the trap handler.
+          Catches signed overflow, shift-out-of-range, divide-by-zero,
+          null dereference, unreachable code, VLA bound, and
+          misaligned pointer use.
+endmenu
+
+menu "Security"
+    config USER_ISOLATION
+        bool "User-space isolation checks"
+        default y
+        depends on RISCV_MODE_S
+        help
+          Enable strict kernel/user boundary checks on trap/syscall paths.
+          Best-effort protection in bare mode; strongest with Sv39 enabled.
+
+    config STACK_PROTECTOR
+        bool "Stack-protector (-fstack-protector-strong)"
+        default y
+        help
+          Enable GCC stack-protector to detect stack buffer overflows at
+          runtime.  Adds a canary value between local variables and the
+          return address; __stack_chk_fail() panics on corruption.  The
+          canary is initialized from entropy-mixed rdtime() at boot.
+          Disable with CONFIG_STACK_PROTECTOR=n for minimal builds.
+endmenu
+
+menu "Subsystems"
+    config NET_TCP
+        bool "TCP/IP networking"
+        default y
+        help
+          Full TCP/IP stack with connection pool, RTT-based
+          retransmission, and sliding window.
+
+    config NET_MDNS
+        bool "mDNS responder"
+        default y
+        depends on NET_UDP
+        help
+          Answer A-record queries for mazu.local on the local
+          network (RFC 6762).
+
+    config WEB_TELEMETRY
+        bool "Web telemetry API endpoints"
+        default y
+        depends on NET_TCP
+        help
+          Expose /api/stats and /api/klog JSON endpoints for
+          real-time kernel telemetry (memory, TCP, scheduler,
+          callout, security, watchdog, per-CPU counters).
+          The web dashboard polls these endpoints for live
+          metrics.  Disable to save code size when telemetry
+          is not needed.
+
+    config KLOG_SIZE
+        int "Kernel log ring buffer size (bytes, power of 2)"
+        default 65536 if EVENTLOG
+        default 4096
+        range 1024 65536
+        help
+          Size of the klog ring buffer in bytes.  Must be a
+          power of 2.  Larger buffers retain more log history
+          for /api/klog at the cost of static RAM.  4096 is
+          sufficient for typical workloads; increase to 65536
+          for high-throughput telemetry or when
+          CONFIG_EVENTLOG generates many KTRACE events.
+
+    config RAMFS_WRITABLE
+        bool "Writable RAM filesystem"
+        default n
+        help
+          Allow creating, writing, and deleting files at runtime.
+
+    config VIRTIO_BLK
+        bool "VirtIO block device driver"
+        default n
+        help
+          VirtIO MMIO block device driver for persistent storage.
+
+endmenu
+
+menu "Networking Features"
+    depends on NET_TCP
+
+    config NET_UDP
+        bool "UDP listener table"
+        default y
+        help
+          Generic UDP receive-path with a 16-entry listener table.
+          Required by the DNS client, mDNS responder, and DHCP.
+
+    config WEBSOCKET
+        bool "WebSocket upgrade path"
+        default y
+        help
+          WebSocket support in the HTTP server (SHA-1, Base64,
+          frame codec, PING/PONG/CLOSE).
+
+    config DHCP
+        bool "DHCPv4 boot-time client"
+        default y
+        depends on NET_UDP
+        help
+          UDP substrate and DHCPv4 DISCOVER/OFFER/REQUEST/ACK
+          exchange at boot.  Falls back to static config.txt
+          address on timeout.
+
+    config DEBUG_ENDPOINT
+        bool "/debug HTTP endpoint"
+        default n
+        help
+          Expose a plaintext /debug endpoint showing task IDs,
+          TCP pool occupancy, and free-page count.
+          Never enable in release builds.
+
+    config PMTUD
+        bool "Path MTU Discovery (RFC 1191)"
+        default y
+        help
+          Set Don't-Fragment on all outbound TCP packets and handle
+          ICMP Fragmentation Needed (Type 3 Code 4) to discover the
+          path MTU.  Reduces TCP MSS to avoid IP fragmentation.
+
+    config TCP_SACK
+        bool "TCP Selective Acknowledgment (RFC 2018)"
+        default y
+        help
+          Negotiate SACK-permitted on SYN and generate SACK blocks in
+          ACKs when out-of-order segments are received.  On the sender
+          side, parse peer SACK blocks to selectively retransmit only
+          missing segments during fast recovery.
+
+    config SYN_COOKIES
+        bool "SYN cookies (RFC 4987)"
+        default n
+        help
+          When the SYN backlog exceeds a threshold, encode connection
+          state into the ISN (SYN cookie) instead of allocating a
+          connection slot.  This defends against SYN flood attacks at
+          the cost of losing TCP options (SACK, timestamps, window
+          scale) for cookie-validated connections.
+endmenu
+
+menu "Memory Layout"
+    config PAGE_SIZE
+        hex "Page size"
+        default 0x1000
+
+    config KERN_BASE_PADDR
+        hex "Kernel base physical address"
+        default 0x80200000
+        help
+          OpenSBI occupies 0x80000000-0x80200000; kernel loads here.
+
+    config KERN_BASE_VADDR
+        hex "Kernel base virtual address"
+        default 0x80200000
+        help
+          Identity mapping (bare mode: satp=0, virt == phys).
+
+    config KERN_DYN_PADDR
+        hex "Dynamic memory physical start"
+        default 0x81000000
+        help
+          Dynamic memory starts 14 MB after the kernel base.
+
+    config KERN_DYN_VADDR
+        hex "Dynamic memory virtual start"
+        default 0x81000000
+
+    config KERN_DYN_LEN
+        hex "Dynamic memory region length"
+        default 0x3fe00000
+        help
+          ~990 MB dynamic region within 1 GB DRAM.
+endmenu
+
+menu "Build Options"
+    config SEMIHOSTING
+        bool "RISC-V semihosting support"
+        default n
+        help
+          Enable the RISC-V semihosting protocol for host
+          communication (early console, exit codes, host file I/O).
+          Development tool; compile out for production.
+
+    config UBSAN
+        bool "Undefined behavior sanitizer (UBSan trap mode)"
+        default n
+        help
+          Enable GCC UBSan with -fsanitize-trap so that undefined
+          behavior triggers an ebreak (breakpoint trap) instead of
+          calling a runtime.  No runtime library needed.
+          Catches: signed overflow, shift-out-of-range, divide-by-zero,
+          null dereference (compiler-proven), unreachable code, VLA
+          bound, misaligned pointer.
+          The trap handler prints sepc and a backtrace on hit.
+          Development tool; compile out for production.
+
+    config EVENTLOG
+        bool "Structured event log (KTRACE)"
+        default n
+        help
+          Emit machine-readable KTRACE events for scheduler state
+          changes, TCP state transitions, and syscall entry/exit.
+          Events are written through the printk path and can be
+          replayed by scripts/check_eventv1.py for offline
+          verification.  See docs/EVENTV1_SPEC.md for the schema.
+          Zero overhead when disabled.
+
+    config EVENTLOG_SYSCALLS
+        bool "Trace syscall entry/exit"
+        default n
+        depends on EVENTLOG
+        help
+          Emit KTRACE syscall_entry/syscall_exit attribution records.
+          This is useful for offline syscall analysis, but it adds
+          formatted logging work to every syscall. Leave disabled for
+          lower syscall latency.
+
+endmenu

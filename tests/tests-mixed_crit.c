@@ -1,0 +1,82 @@
+/* SPDX-License-Identifier: MIT */
+#include <mazu/sched.h>
+#include <mazu/selftest.h>
+
+/* Test: MC pair initialization sets criticality fields. */
+static i32 test_mc_init_pair(void)
+{
+    struct sched_domain hi, lo;
+    sched_domain_init(&hi, time_ms_to_ticks(70), time_ms_to_ticks(100));
+    sched_domain_init(&lo, time_ms_to_ticks(30), time_ms_to_ticks(100));
+
+    sched_mc_init_pair(&hi, &lo);
+
+    if (hi.criticality != SCHED_DOMAIN_CRIT_HI)
+        return 1;
+    if (lo.criticality != SCHED_DOMAIN_CRIT_LO)
+        return 1;
+    if (hi.mc_peer != &lo || lo.mc_peer != &hi)
+        return 1;
+    if (hi.mc_state != MC_NORMAL || lo.mc_state != MC_NORMAL)
+        return 1;
+
+    callout_cancel_sync(&hi.refill_callout);
+    callout_cancel_sync(&lo.refill_callout);
+    return 0;
+}
+DEFINE_SELFTEST(mc_init_pair, test_mc_init_pair);
+
+/* Test: escalation triggers when HI overruns budget. */
+static i32 test_mc_escalation(void)
+{
+    struct sched_domain hi, lo;
+    sched_domain_init(&hi, time_ms_to_ticks(70), time_ms_to_ticks(100));
+    sched_domain_init(&lo, time_ms_to_ticks(30), time_ms_to_ticks(100));
+    sched_mc_init_pair(&hi, &lo);
+
+    /* Simulate HI overrun. */
+    __atomic_store_n(&hi.consumed_ticks, hi.quantum_ticks + 1,
+                     __ATOMIC_RELAXED);
+    sched_mc_check_escalation(&hi);
+
+    if (hi.mc_state != MC_ESCALATED)
+        return 1;
+    if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_DEPLETED)
+        return 1;
+
+    /* Recovery after HI refill. */
+    sched_mc_check_recovery(&hi);
+
+    if (hi.mc_state != MC_NORMAL)
+        return 1;
+    if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE)
+        return 1;
+
+    callout_cancel_sync(&hi.refill_callout);
+    callout_cancel_sync(&lo.refill_callout);
+    return 0;
+}
+DEFINE_SELFTEST(mc_escalation, test_mc_escalation);
+
+/* Test: no escalation when HI is within budget. */
+static i32 test_mc_no_escalation(void)
+{
+    struct sched_domain hi, lo;
+    sched_domain_init(&hi, time_ms_to_ticks(70), time_ms_to_ticks(100));
+    sched_domain_init(&lo, time_ms_to_ticks(30), time_ms_to_ticks(100));
+    sched_mc_init_pair(&hi, &lo);
+
+    __atomic_store_n(&hi.consumed_ticks, hi.quantum_ticks / 2,
+                     __ATOMIC_RELAXED);
+    sched_mc_check_escalation(&hi);
+
+    if (hi.mc_state != MC_NORMAL)
+        return 1;
+    if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE)
+        return 1;
+
+    callout_cancel_sync(&hi.refill_callout);
+    callout_cancel_sync(&lo.refill_callout);
+    return 0;
+}
+DEFINE_SELFTEST(mc_no_escalation, test_mc_no_escalation);

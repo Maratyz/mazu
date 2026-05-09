@@ -1,0 +1,4 @@
+CompileFlags:
+  Add: [-Iinclude/, -D__riscv, -D__riscv_xlen=64, --target=riscv64-unknown-elf]
+Diagnostics:
+  Suppress: bool_redeclaration

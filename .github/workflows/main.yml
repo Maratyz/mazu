@@ -1,0 +1,430 @@
+# CI: lint, build, and HTTP integration check.
+#
+# Runners: ubuntu-24.04. The RISC-V cross toolchain is fetched at a pinned
+# release tag and verified against a sha256 committed in
+# .ci/riscv-toolchain.txt; the sha256 is also cross-checked against the
+# GitHub release-asset digest field at runtime.
+#
+# Jobs (4 parallel streams):
+#   format             : clang-format-22 conformance.
+#   analysis           : trailing newline, security grep, cppcheck.
+#   build-and-test [up]  : configs/ci_defconfig (CONFIG_SMP=n) on Ubuntu's
+#                          QEMU 8.2; SLIRP + TAP integration.
+#   build-and-test [smp] : configs/defconfig (CONFIG_SMP=y, CPU_MAX=4) on
+#                          QEMU built from source (Ubuntu's 8.2 wedges hart
+#                          wfi wakeup at >=2 harts); SLIRP + TAP integration.
+#
+# The matrix runs UP and SMP variants in parallel. Each variant builds the
+# same kernel, exercises both SLIRP and TAP networking, and validates the
+# git hooks were auto-installed by `make all`.
+#
+# clang-format-22 is installed by adding apt.llvm.org as a signed repo
+# (verified GPG fingerprint), not by piping a remote script into bash.
+name: build-and-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CROSS_COMPILE: riscv64-unknown-elf-
+  TOOLCHAIN_DIR: ${{ github.workspace }}/.cache/riscv
+  # apt.llvm.org snapshot signing key fingerprint, as served from
+  # https://apt.llvm.org/llvm-snapshot.gpg.key. LLVM has rotated this key
+  # in the past; if upstream rotates again, CI's fingerprint check will
+  # surface the mismatch and this pin must be bumped via PR.
+  LLVM_GPG_FINGERPRINT: 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+  # Source-built QEMU prefix for the SMP variant. The version + sha256
+  # are pinned in .ci/qemu.txt; Ubuntu 24.04's stock 8.2.2 has a TCG rv64
+  # SMP hart-wfi wakeup miss that wedges the barrier selftest, so we
+  # build something newer.
+  QEMU_PREFIX: ${{ github.workspace }}/.cache/qemu
+
+jobs:
+  # ---- clang-format-22 conformance ----
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute weekly cache rotator
+        id: rot
+        run: echo "iso_week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v5
+        with:
+          path: ~/apt-cache
+          # Weekly rotation prevents the apt cache from stagnating on
+          # upstream package updates while still amortising per-PR cost.
+          key: apt-format-${{ runner.os }}-${{ hashFiles('.github/workflows/main.yml') }}-${{ steps.rot.outputs.iso_week }}
+
+      - name: Install clang-format-22 (verified apt.llvm.org repo)
+        run: |
+          set -euo pipefail
+          mkdir -p ~/apt-cache
+          sudo apt-get update
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
+            curl ca-certificates gnupg lsb-release
+
+          # Fetch the LLVM signing key and verify its fingerprint *before*
+          # trusting it. apt.llvm.org's llvm.sh wrapper would do roughly the
+          # same, but executing a remote script as root is unnecessary.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm.key
+          actual_fpr=$(gpg --show-keys --with-fingerprint --with-colons /tmp/llvm.key \
+            | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ "$actual_fpr" != "$LLVM_GPG_FINGERPRINT" ]; then
+            echo "::error::LLVM apt key fingerprint mismatch: $actual_fpr (expected $LLVM_GPG_FINGERPRINT)"
+            exit 1
+          fi
+          sudo install -d -m 0755 /etc/apt/keyrings
+          gpg --dearmor < /tmp/llvm.key | sudo tee /etc/apt/keyrings/llvm.gpg >/dev/null
+          rm -f /tmp/llvm.key
+
+          codename=$(lsb_release -cs)
+          echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list >/dev/null
+
+          sudo apt-get update
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" clang-format-22
+          clang-format-22 --version
+
+      - name: Code formatting (clang-format-22)
+        env:
+          CLANG_FORMAT: clang-format-22
+        run: .ci/check-format.sh
+
+  # ---- Lightweight static analysis (no LLVM dependency) ----
+  analysis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute weekly cache rotator
+        id: rot
+        run: echo "iso_week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v5
+        with:
+          path: ~/apt-cache
+          key: apt-analysis-${{ runner.os }}-${{ hashFiles('.github/workflows/main.yml') }}-${{ steps.rot.outputs.iso_week }}
+
+      - name: Install analysis tools
+        run: |
+          set -euo pipefail
+          mkdir -p ~/apt-cache
+          sudo apt-get update
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
+            cppcheck file
+
+      - name: Trailing newline
+        run: .ci/check-newline.sh
+
+      - name: Security checks
+        run: .ci/check-security.sh
+
+      - name: Static analysis (cppcheck)
+        run: .ci/check-cppcheck.sh
+
+  # ---- Build kernel + run integration tests (UP and SMP variants) ----
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: up
+            defconfig: configs/ci_defconfig
+            qemu-source: false
+            check-selftest-timeout: "180"
+          - variant: smp
+            defconfig: configs/defconfig
+            qemu-source: true
+            check-selftest-timeout: "240"
+    name: build-and-test (${{ matrix.variant }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute weekly cache rotator
+        id: rot
+        run: echo "iso_week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v5
+        with:
+          path: ~/apt-cache
+          key: apt-build-${{ runner.os }}-${{ matrix.variant }}-${{ hashFiles('.github/workflows/main.yml') }}-${{ steps.rot.outputs.iso_week }}
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p ~/apt-cache
+          sudo apt-get update
+          # Common deps: kernel build, runtime, TAP DNS forwarder.
+          common=(
+            device-tree-compiler
+            python3 curl bash file lsof ca-certificates xz-utils
+            iproute2 dnsmasq-base
+          )
+          # The UP variant runs Ubuntu's QEMU 8.2; the SMP variant builds
+          # its own QEMU 10.x from source and pulls in the build deps.
+          if [ "${{ matrix.qemu-source }}" = "true" ]; then
+            extra=(
+              build-essential ninja-build pkg-config
+              libglib2.0-dev libpixman-1-dev libslirp-dev
+              python3-venv flex bison
+            )
+          else
+            extra=(qemu-system-misc qemu-utils)
+          fi
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
+            "${common[@]}" "${extra[@]}"
+
+      # Read the pinned release+asset+sha256 from .ci/riscv-toolchain.txt and
+      # cross-check the committed hash against the live GitHub release-asset
+      # digest. Both must agree before we even download.
+      - name: Resolve and verify pinned RISC-V toolchain
+        id: tc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pin=.ci/riscv-toolchain.txt
+          release=$(awk -F= '$1=="release"{print $2}' "$pin")
+          asset=$(awk -F= '$1=="asset"{print $2}' "$pin")
+          sha256=$(awk -F= '$1=="sha256"{print $2}' "$pin")
+          if [ -z "$release" ] || [ -z "$asset" ] || [ -z "$sha256" ]; then
+            echo "::error::$pin is missing release/asset/sha256"
+            exit 1
+          fi
+
+          # Cross-check committed sha256 against the GitHub release-asset
+          # digest field.  Catches the case where the pin file is stale or
+          # the upstream tag has been re-tagged.
+          api="https://api.github.com/repos/riscv-collab/riscv-gnu-toolchain/releases/tags/${release}"
+          api_digest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$api" \
+            | jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .digest')
+          if [ "$api_digest" != "sha256:${sha256}" ]; then
+            echo "::error::pinned sha256 ($sha256) does not match GitHub digest ($api_digest)"
+            exit 1
+          fi
+
+          url="https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/${release}/${asset}"
+          {
+            echo "release=$release"
+            echo "asset=$asset"
+            echo "sha256=$sha256"
+            echo "url=$url"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned toolchain: $asset @ $release ($sha256)"
+
+      - name: Cache RISC-V toolchain
+        id: cache-tc
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.TOOLCHAIN_DIR }}
+          # Cache key includes the verified sha256, not the asset name -- a
+          # mutated upstream asset (same name, different content) cannot
+          # silently reuse the prior cache entry.
+          key: riscv-tc-${{ runner.os }}-${{ steps.tc.outputs.release }}-${{ steps.tc.outputs.sha256 }}
+
+      - name: Download and install RISC-V GNU toolchain
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        env:
+          # Pass step outputs through env vars instead of ${{ … }} string
+          # interpolation -- a hostile pin file otherwise gets to splice
+          # arbitrary shell into this `run:`.
+          TC_URL: ${{ steps.tc.outputs.url }}
+          TC_SHA256: ${{ steps.tc.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${TOOLCHAIN_DIR}"
+          curl -fsSL -o /tmp/riscv.tar.xz "$TC_URL"
+
+          # Verify against the committed sha256 (already cross-checked
+          # against the live release digest in the previous step).
+          echo "${TC_SHA256}  /tmp/riscv.tar.xz" | sha256sum -c -
+
+          # Extract into a staging dir and confirm the layout is a single
+          # top-level directory before promoting it. Avoids
+          # --strip-components=1 silently scattering a multi-root archive
+          # into TOOLCHAIN_DIR.
+          stage=$(mktemp -d)
+          tar -xJf /tmp/riscv.tar.xz -C "$stage"
+          shopt -s nullglob
+          entries=( "$stage"/* )
+          shopt -u nullglob
+          if [ "${#entries[@]}" -ne 1 ] || [ ! -d "${entries[0]}" ]; then
+            echo "::error::unexpected tarball layout (expected single root dir):"
+            ls -la "$stage"
+            exit 1
+          fi
+          mv "${entries[0]}"/* "${TOOLCHAIN_DIR}/"
+          test -x "${TOOLCHAIN_DIR}/bin/${CROSS_COMPILE}gcc" \
+            || { echo "::error::${CROSS_COMPILE}gcc not found after extraction"; exit 1; }
+          rm -rf "$stage" /tmp/riscv.tar.xz
+
+      - name: Add toolchain to PATH
+        run: echo "${TOOLCHAIN_DIR}/bin" >> "$GITHUB_PATH"
+
+      # ---- QEMU from source (SMP variant only) -----------------------
+      # Ubuntu 24.04's QEMU 8.2.2 has a TCG rv64 SMP hart-wfi wakeup miss
+      # that wedges the barrier_sync selftest at >=2 harts. Build a
+      # pinned newer QEMU (.ci/qemu.txt) and prepend its bin/ to PATH.
+      # Cache key includes the verified sha256, so a bumped pin invalidates
+      # cleanly without ever serving a stale or tampered tree.
+      - name: Resolve and verify pinned QEMU (SMP)
+        if: matrix.qemu-source
+        id: qemu
+        run: |
+          set -euo pipefail
+          pin=.ci/qemu.txt
+          version=$(awk -F= '$1=="version"{print $2}' "$pin")
+          sha256=$(awk -F= '$1=="sha256"{print $2}' "$pin")
+          if [ -z "$version" ] || [ -z "$sha256" ]; then
+            echo "::error::$pin is missing version/sha256"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "sha256=$sha256"
+            echo "url=https://download.qemu.org/qemu-$version.tar.xz"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned QEMU: $version ($sha256)"
+
+      - name: Cache QEMU build (SMP)
+        if: matrix.qemu-source
+        id: cache-qemu
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ runner.os }}-${{ steps.qemu.outputs.version }}-${{ steps.qemu.outputs.sha256 }}
+
+      - name: Build QEMU (SMP)
+        if: matrix.qemu-source && steps.cache-qemu.outputs.cache-hit != 'true'
+        env:
+          # Pass step outputs through env vars rather than ${{ … }} string
+          # interpolation; values shouldn't be spliced into shell.
+          QEMU_URL: ${{ steps.qemu.outputs.url }}
+          QEMU_SHA256: ${{ steps.qemu.outputs.sha256 }}
+          QEMU_VERSION: ${{ steps.qemu.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${QEMU_PREFIX}"
+          curl -fsSL -o /tmp/qemu.tar.xz "$QEMU_URL"
+          echo "${QEMU_SHA256}  /tmp/qemu.tar.xz" | sha256sum -c -
+
+          stage=$(mktemp -d)
+          tar -xJf /tmp/qemu.tar.xz -C "$stage" --strip-components=1
+          rm -f /tmp/qemu.tar.xz
+          cd "$stage"
+          # Minimal config: only riscv64-softmmu, no GUI/manuals/tools, but
+          # keep TCG + SLIRP since both are required by `make check`.
+          ./configure \
+            --prefix="${QEMU_PREFIX}" \
+            --target-list=riscv64-softmmu \
+            --enable-tcg --enable-slirp \
+            --disable-docs --disable-tools --disable-vnc \
+            --disable-libssh --disable-werror \
+            --disable-gtk --disable-sdl --disable-bsd-user \
+            --disable-linux-user
+          make -j"$(nproc)"
+          make install
+          rm -rf "$stage"
+
+      - name: Prepend source-built QEMU to PATH (SMP)
+        if: matrix.qemu-source
+        run: echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain and QEMU
+        run: |
+          ${CROSS_COMPILE}gcc --version
+          which qemu-system-riscv64
+          qemu-system-riscv64 --version | head -1
+
+      - name: defconfig (${{ matrix.variant }})
+        run: make DEFCONFIG=${{ matrix.defconfig }} defconfig
+
+      - name: Build kernel
+        run: make -j"$(nproc)"
+
+      # 'make all' triggers install-hooks when symlinks are missing.  Verify
+      # they are in place after the build so a regression in that target gets
+      # caught here, not later when a developer commits.
+      - name: Validate git hooks installed
+        run: |
+          set -euo pipefail
+          missing=0
+          for hook in pre-commit commit-msg prepare-commit-msg; do
+            target=".git/hooks/$hook"
+            if [ ! -L "$target" ]; then
+              echo "::error::missing hook symlink: $target (make install-hooks should have created it)"
+              missing=1
+              continue
+            fi
+            link=$(readlink "$target")
+            case "$link" in
+              ../../scripts/*.hook)
+                echo "ok: $target -> $link" ;;
+              *)
+                echo "::error::$target points to unexpected target: $link"
+                missing=1 ;;
+            esac
+          done
+          exit "$missing"
+
+      - name: Run integration check (make check, SLIRP)
+        env:
+          CHECK_TIMEOUT: 60
+          CHECK_SELFTEST_TIMEOUT: ${{ matrix.check-selftest-timeout }}
+        run: make check
+
+      # ---- TAP networking validation ---------------------------------
+      # GitHub-hosted Linux runners ship /dev/net/tun and grant
+      # passwordless sudo, so we can stand up a host<->guest point-to-point
+      # link, boot mazu in TAP mode, and re-run the HTTP integration
+      # against http://192.168.100.2.  Mirrors the README's TAP workflow
+      # but skips the bridge/MASQUERADE/DNAT machinery dev mode needs --
+      # CI only requires the host-to-guest path.
+      - name: Setup TAP (vm0 @ 192.168.100.1)
+        run: sudo TAP_USER=$USER .ci/setup-tap.sh
+
+      - name: Run integration check (TAP)
+        env:
+          # 120 s rather than 60: virtio-blk handshake under Ubuntu's
+          # stock QEMU 8.2 occasionally misses the deadline on the
+          # second QEMU launch of the job (after `make check`'s SLIRP
+          # boot has already exited).
+          BOOT_TIMEOUT: 120
+        run: .ci/test-tap.sh
+
+      - name: Cleanup TAP
+        if: always()
+        run: sudo .ci/cleanup-tap.sh
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: check-logs-${{ matrix.variant }}
+          path: |
+            build/check_serial.log
+            build/check_selftest_serial.log
+            build/check_tap_serial.log
+            .packets.pcap
+          if-no-files-found: ignore
+          retention-days: 7

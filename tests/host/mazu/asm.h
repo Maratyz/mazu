@@ -11,15 +11,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define halt_execution()          \
-    do {                          \
-        fprintf(stderr, "halt\n");\
-        abort();                  \
+#define halt_execution()           \
+    do {                           \
+        fprintf(stderr, "halt\n"); \
+        abort();                   \
     } while (0)
 
-static inline void hlt(void)
-{
-}
+static inline void hlt(void) {}
 
 static inline bool pseudo_rand_u64(u64 *result)
 {
@@ -29,11 +27,7 @@ static inline bool pseudo_rand_u64(u64 *result)
     return true;
 }
 
-static inline void disable_interrupts(void)
-{
-}
-static inline void enable_interrupts(void)
-{
-}
+static inline void disable_interrupts(void) {}
+static inline void enable_interrupts(void) {}
 
 #endif /* MAZU_ASM_H */

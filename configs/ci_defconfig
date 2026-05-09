@@ -1,0 +1,22 @@
+# Mazu CI configuration -- uniprocessor.
+#
+# Ubuntu 24.04 ships QEMU 8.2, whose TCG rv64 SMP exhibits a hart-wfi
+# wakeup hang in barrier_sync regardless of CPU_MAX (reproduced at both
+# 4 and 2 harts). The same kernel passes 240/240 selftests under newer
+# QEMU 9+/10 locally, so this is an emulator-version limitation, not a
+# kernel regression. Disable SMP for CI; configs/defconfig keeps SMP=y
+# for local development. SMP-gated tests (#if CONFIG_SMP) become inert.
+CONFIG_SMP=n
+CONFIG_CPU_MAX=1
+CONFIG_SCHED_EEVDF=y
+CONFIG_SCHED_DEADLINE=y
+CONFIG_MIXED_CRIT=y
+CONFIG_MEASURE_LATENCY=y
+CONFIG_RAMFS_WRITABLE=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_NET_UDP=y
+# CONFIG_DHCP is not set
+CONFIG_NET_MDNS=y
+CONFIG_TCP_SACK=y
+CONFIG_SEMIHOSTING=y
+CONFIG_EVENTLOG=y

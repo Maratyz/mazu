@@ -6,5 +6,8 @@ rootfs/bin/
 !.clang-format
 !.cppcheck-suppress
 !.gitignore
+!.editorconfig
+!.ci/
+!.github/
 compile_commands.json
 tools/kconfig

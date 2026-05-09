@@ -96,10 +96,16 @@ static i32 test_barrier_destroy_busy(void)
 
     /* Release the worker by completing the barrier ourselves. */
     barrier_wait(&busy_barrier);
-    SELFTEST_KICK_AND_YIELD(50);
 
-    /* Now destroy should succeed. */
-    rc = barrier_destroy(&busy_barrier);
+    /* Poll for worker exit instead of a fixed sleep: CI QEMU schedules the
+     * worker more slowly than a native host, and a single 50 ms yield isn't
+     * always enough for it to leave barrier_wait.
+     */
+    rc = -(i32) EBUSY;
+    for (i32 i = 0; i < 60 && rc != 0; i++) {
+        SELFTEST_KICK_AND_YIELD(20);
+        rc = barrier_destroy(&busy_barrier);
+    }
     SELFTEST_ASSERT(rc == 0, 4);
 
     return 0;
@@ -138,9 +144,11 @@ static i32 test_barrier_cyclic(void)
     /* Round 1. */
     barrier_wait(&cycle_barrier);
     __atomic_fetch_add(&cycle_round1, 1, __ATOMIC_ACQ_REL);
-    SELFTEST_KICK_AND_YIELD(20);
 
-    SELFTEST_ASSERT(__atomic_load_n(&cycle_round1, __ATOMIC_ACQUIRE) == 2, 2);
+    /* Poll for the worker's increment. A fixed 20 ms yield races on slow CI
+     * QEMU; selftest_poll_count retries up to 60 * 20 ms.
+     */
+    SELFTEST_ASSERT(!selftest_poll_count(&cycle_round1, 2, 60, 20), 2);
 
     /* Round 2. */
     barrier_wait(&cycle_barrier);

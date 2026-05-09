@@ -1,0 +1,18 @@
+# Pinned RISC-V GNU toolchain release.
+# Source: https://github.com/riscv-collab/riscv-gnu-toolchain/releases
+#
+# To roll the pin:
+#   1. Pick a release tag.
+#   2. Update `release=` and `asset=` below.
+#   3. Run:
+#        curl -fsSL -H 'Accept: application/vnd.github+json' \
+#          https://api.github.com/repos/riscv-collab/riscv-gnu-toolchain/releases/tags/<tag> \
+#          | jq -r '.assets[] | select(.name == "<asset>") | .digest'
+#      and copy the sha256:... value below.
+#
+# CI verifies the downloaded tarball against `sha256` (committed) AND against
+# the GitHub release-asset `digest` field (live API). Both must match.
+
+release=2026.05.06
+asset=riscv64-elf-ubuntu-22.04-gcc.tar.xz
+sha256=c5878eee322e079fcf4f1361101ff4e697fe2ea2a828539968c4895d995f4a1b

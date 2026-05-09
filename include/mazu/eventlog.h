@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Structured event log for kernel state transitions.
  *
- * Emits machine-readable KTRACE lines (see docs/KTRACE_SPEC.md) for
+ * Emits machine-readable KTRACE lines; see the event schema notes for
  * scheduler state changes, TCP state transitions, and syscall attribution.
  * Gated on CONFIG_EVENTLOG - zero overhead when disabled.
  */

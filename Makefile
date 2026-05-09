@@ -113,7 +113,7 @@ kernel_files-$(CONFIG_DHCP) += kernel/net/dhcp.c
 kernel_files-$(CONFIG_NET_MDNS) += kernel/net/mdns.c
 
 # Library (always compiled)
-lib_files-y := lib/string.c lib/json.c lib/ip_addr.c
+lib_files-y := lib/string.c lib/json.c lib/ip_addr.c lib/builtins.c
 lib_files-$(CONFIG_STACK_PROTECTOR) += lib/stack_chk.c
 
 # WebSocket support (requires TCP)
@@ -187,6 +187,7 @@ $(USER_HELLO_ELF): $(USER_HELLO_OBJ) | $(BUILD_DIR)
 	$(Q)$(LD) -m elf64lriscv --no-relax -Ttext=0x10000 -o $@ $<
 
 $(USER_HELLO_BIN): $(USER_HELLO_ELF)
+	$(Q)mkdir -p $(dir $@)
 	@echo "  OBJCOPY $@"
 	$(Q)$(OBJCOPY) -O binary $< $@
 

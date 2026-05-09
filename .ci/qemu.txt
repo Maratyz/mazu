@@ -1,0 +1,13 @@
+# Pinned source-built QEMU for CI's SMP variant.
+# Source: https://download.qemu.org/qemu-${version}.tar.xz
+#
+# To roll the pin:
+#   1. Update `version=` below.
+#   2. curl -fsSL -O https://download.qemu.org/qemu-${version}.tar.xz
+#      sha256sum qemu-${version}.tar.xz
+#      and copy the hash into `sha256=`.
+#
+# CI verifies the downloaded tarball against `sha256` before extraction.
+
+version=10.1.5
+sha256=1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693

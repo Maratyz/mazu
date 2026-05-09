@@ -303,6 +303,62 @@ static i32 test_tcp_sack_scoreboard(void)
 }
 DEFINE_SELFTEST(tcp_sack_scoreboard, test_tcp_sack_scoreboard);
 
+static i32 syn_option_state_gate_body(struct tcp_conn *conn)
+{
+    u8 syn_opts[10] = {
+        TCP_OPT_MSS_KIND,
+        TCP_OPT_MSS_LENGTH,
+        0x02,
+        0x00,
+        TCP_OPT_WS_KIND,
+        TCP_OPT_WS_LENGTH,
+        7,
+        TCP_OPT_NOP_KIND,
+        TCP_OPT_SACK_PERMITTED_KIND,
+        TCP_OPT_SACK_PERMITTED_LENGTH,
+    };
+    struct byte_view syn_view = byte_view_new(syn_opts, sizeof(syn_opts));
+
+    conn->state = TCP_CONN_STATE_ESTABLISHED;
+    conn->mss = 1460;
+    conn->send_window_scale = 3;
+    conn->use_window_scale = false;
+
+    struct tsopt ignored =
+        tcp_handle_options(conn, TCP_HDR_FLAG_SYN | TCP_HDR_FLAG_ACK, syn_view);
+    if (conn->mss != 1460)
+        return 1;
+    if (conn->send_window_scale != 3)
+        return 1;
+    if (conn->use_window_scale)
+        return 1;
+    if (ignored.have_sack_permitted)
+        return 1;
+
+    conn->state = TCP_CONN_STATE_SYN_SENT;
+    conn->mss = TCP_CONN_DEFAULT_MSS;
+    conn->send_window_scale = 0;
+    conn->use_window_scale = false;
+
+    struct tsopt applied = tcp_handle_options(conn, TCP_HDR_FLAG_SYN, syn_view);
+    if (conn->mss != 512)
+        return 1;
+    if (conn->send_window_scale != 7)
+        return 1;
+    if (!conn->use_window_scale)
+        return 1;
+    if (!applied.have_sack_permitted)
+        return 1;
+
+    return 0;
+}
+
+static i32 test_tcp_syn_option_state_gate(void)
+{
+    return test_with_conn_slot(syn_option_state_gate_body);
+}
+DEFINE_SELFTEST(tcp_syn_option_state_gate, test_tcp_syn_option_state_gate);
+
 /* Test 10: SACK block in tsopt parsing (P2.9o).
  * Verifies the option parser can decode a SACK option from raw bytes.
  */

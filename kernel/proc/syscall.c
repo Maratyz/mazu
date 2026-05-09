@@ -38,6 +38,12 @@
 #include "pipe.h"
 #include "signal.h"
 
+/* The per-process allow-list (struct proc::syscall_allow[2]) is two u64 words
+ * indexed by (nr / 64). Adding a 65th syscall without widening the array
+ * silently writes past the end during dispatch.
+ */
+static_assert(SYS_NR <= 128, "syscall_allow[2] only covers nrs 0..127");
+
 /* Copy a user-space path into kpath[257].  Returns the kernel str on success,
  * or sets *err to a negative errno and returns an empty str.
  */
@@ -470,10 +476,13 @@ static i64 sys_spawn(struct trap_frame *tf, struct sched_task *td)
     if (perr < 0)
         return perr;
 
-    /* Copy file actions from user-space (if any). */
+    /* Copy file actions from user-space (if any). kpaths must outlive kfa
+     * because copy_file_actions stores &kpaths[i] into kfa[i].path, which
+     * is later dereferenced by spawn_apply_file_actions below.
+     */
     struct spawn_file_action kfa[SPAWN_FA_MAX];
+    char kpaths[SPAWN_FA_MAX][SPAWN_FA_PATH_MAX];
     if (fa_count > 0) {
-        char kpaths[SPAWN_FA_MAX][SPAWN_FA_PATH_MAX];
         i64 fa_rc = copy_file_actions(ufa_ptr, fa_count, kfa, kpaths);
         if (fa_rc < 0)
             return fa_rc;

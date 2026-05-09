@@ -2523,11 +2523,27 @@ static bool tcp_checksum_is_ok(struct tcp_ip_pseudo_header pseudo_hdr,
     return internet_checksum_finalize(checksum).inner == 0;
 }
 
+static bool tcp_conn_accepts_syn_options(const struct tcp_conn *conn)
+{
+    assert(conn);
+
+    switch (conn->state) {
+    case TCP_CONN_STATE_LISTEN:
+    case TCP_CONN_STATE_SYN_SENT:
+    case TCP_CONN_STATE_SYN_RCVD:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static struct tsopt tcp_handle_options(struct tcp_conn *conn,
                                        u8 flags,
                                        struct byte_view opts)
 {
     struct tsopt tsopt = {.have_ts = false, .tsval = 0, .tsecr = 0};
+    bool allow_syn_options =
+        (flags & TCP_HDR_FLAG_SYN) && tcp_conn_accepts_syn_options(conn);
 
     sz i = 0;
     while (i < opts.len) {
@@ -2541,15 +2557,20 @@ static struct tsopt tcp_handle_options(struct tcp_conn *conn,
             /* The length field can be ignored because it is always 4. */
             if (i + TCP_OPT_MSS_LENGTH > opts.len)
                 return tsopt;
-            conn->mss = ((u16) opts.dat[i + 2] << 8) | (u16) opts.dat[i + 3];
-            if (conn->mss == 0)
-                conn->mss = TCP_CONN_DEFAULT_MSS;
+            /* MSS is a handshake-only option (RFC 9293 §3.2). Parsing it
+             * before state validation must not let a stray SYN rewrite an
+             * established connection's segment size.
+             */
+            if (allow_syn_options) {
+                u16 mss = ((u16) opts.dat[i + 2] << 8) | (u16) opts.dat[i + 3];
+                conn->mss = mss == 0 ? TCP_CONN_DEFAULT_MSS : mss;
+            }
             i += TCP_OPT_MSS_LENGTH;
             break;
         case TCP_OPT_WS_KIND:
             if (i + TCP_OPT_WS_LENGTH > opts.len)
                 return tsopt;
-            if ((flags & TCP_HDR_FLAG_SYN) && opts.dat[i + 2] <= 14) {
+            if (allow_syn_options && opts.dat[i + 2] <= 14) {
                 conn->send_window_scale = opts.dat[i + 2];
                 conn->use_window_scale = true;
             }
@@ -2571,7 +2592,7 @@ static struct tsopt tcp_handle_options(struct tcp_conn *conn,
         case TCP_OPT_SACK_PERMITTED_KIND:
             if (i + TCP_OPT_SACK_PERMITTED_LENGTH > opts.len)
                 return tsopt;
-            if (flags & TCP_HDR_FLAG_SYN)
+            if (allow_syn_options)
                 tsopt.have_sack_permitted = true;
             i += TCP_OPT_SACK_PERMITTED_LENGTH;
             break;

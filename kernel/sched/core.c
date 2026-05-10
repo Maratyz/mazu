@@ -73,6 +73,7 @@ static inline u64 eevdf_virtual_slice(struct sched_task *task)
     return time_ms_to_ticks(q * 10);
 }
 
+#if CONFIG_SMP
 /* Normalize a task's vruntime when migrating between CPUs.
  * Subtracts the source CPU's floor and adds the destination CPU's
  * floor, so the task's relative position in the vruntime timeline
@@ -89,6 +90,7 @@ static void eevdf_normalize_vruntime(struct sched_task *task,
         task->vruntime = pcpu_min_vruntime[dst_cpu];
     task->vdeadline = task->vruntime + eevdf_virtual_slice(task);
 }
+#endif /* CONFIG_SMP */
 #endif
 
 /* Per-hart idle tasks.  BSP uses idle_tasks[0], secondaries use

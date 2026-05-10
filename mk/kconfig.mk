@@ -20,11 +20,16 @@ config: $(KCONFIG_DIR)/menuconfig.py
 	@KCONFIG_CONFIG=.config python3 $(KCONFIG_DIR)/menuconfig.py $(KCONFIG_SCHEMA)
 	@rm -f $(HEADER_CONFIG)
 
-# Apply a defconfig (default: configs/defconfig)
+# Apply a defconfig (default: configs/defconfig). Optional CONFIG_FRAGMENTS
+# are merged in order to avoid cloning near-identical defconfigs for CI or
+# sanitizer-only variants.
 DEFCONFIG ?= configs/defconfig
+CONFIG_FRAGMENTS ?=
 defconfig: $(KCONFIG_DIR)/menuconfig.py
-	@KCONFIG_CONFIG=.config python3 $(KCONFIG_DIR)/defconfig.py \
-		--kconfig $(KCONFIG_SCHEMA) $(DEFCONFIG)
+	@python3 ./scripts/apply_defconfig.py \
+		--kconfig $(KCONFIG_SCHEMA) \
+		--out .config \
+		$(DEFCONFIG) $(CONFIG_FRAGMENTS)
 	@rm -f $(HEADER_CONFIG)
 
 # Update .config for new/changed Kconfig symbols

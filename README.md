@@ -133,6 +133,7 @@ The configuration schema lives in `configs/Kconfig`.
 make config             # interactive menuconfig TUI
 make defconfig          # apply configs/defconfig (default config)
 make defconfig DEFCONFIG=configs/rt_defconfig       # apply a named defconfig
+make defconfig DEFCONFIG=configs/defconfig CONFIG_FRAGMENTS=configs/fragments/up.config
 make savedefconfig      # save current .config back to configs/defconfig
 make oldconfig          # update .config for new/changed Kconfig symbols
 ```
@@ -147,6 +148,13 @@ Predefined configurations:
 |-----------|-------------|
 | `configs/defconfig` | Default hard-RT profile: SMP, latency tracing, TCP/UDP, DHCP, mDNS, SACK, virtio-blk |
 | `configs/rt_defconfig` | Leaner hard-RT validation profile with SMP, EEVDF, and network options enabled |
+
+Reusable configuration fragments:
+
+| Fragment | Description |
+|----------|-------------|
+| `configs/fragments/up.config` | Force uniprocessor mode for QEMU 8.2-based CI or local repros |
+| `configs/fragments/ubsan.config` | Enable trap-mode UBSan on top of an existing defconfig |
 
 Key feature flags (all configurable via `make config`):
 
@@ -175,7 +183,7 @@ make check              # HTTP integration tests (SLIRP networking)
 make check-selftest     # semihosting self-tests (requires CONFIG_SEMIHOSTING=y)
 make check-smp          # SMP-focused checks (requires CONFIG_SMP=y)
 ./scripts/check.sh      # matrix-style checks across selected profiles
-./scripts/check.sh --profile-matrix  # build + selftest all config profiles
+./scripts/check.sh --profile-matrix  # build + selftest defconfigs and CI overlays
 ```
 
 ## Security

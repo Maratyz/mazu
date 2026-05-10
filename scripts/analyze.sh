@@ -54,9 +54,33 @@ JOBS="${JOBS:-1}"
 #   bugprone-reserved-identifier    -- double-underscore include guards (being renamed)
 #   bugprone-easily-swappable-parameters -- too noisy for kernel APIs
 #   bugprone-suspicious-include     -- selftest .c-in-.c injection pattern
+#   bugprone-branch-clone           -- scheduler state-transition switch documents
+#                                      each TD_STATE_* case independently; collapsing
+#                                      identical empty bodies would erase the inline
+#                                      rationale (see sched_finish_task_switch)
 #   performance-no-int-to-ptr       -- uptr<->pointer casts fundamental to MMIO/paging
 #   clang-analyzer-security.PointerSub -- linker-section iteration (initcall, selftest)
-CHECKS="${CHECKS:-clang-analyzer-*,bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-reserved-identifier,-bugprone-suspicious-include,-performance-no-int-to-ptr,-clang-analyzer-security.PointerSub,-clang-diagnostic-keyword-macro,-clang-diagnostic-gnu-zero-variadic-macro-arguments,-clang-diagnostic-language-extension-token}"
+#   clang-analyzer-security.ArrayBound -- false positives on (a) per-CPU arrays
+#                                      sized to MAX_CPUS=1 in UP builds where the
+#                                      analyzer can't prove cpu==0, and (b)
+#                                      container_of / list_for_each_entry pointer
+#                                      arithmetic the analyzer can't model
+#   clang-analyzer-core.UndefinedBinaryOperatorResult -- byte_view / str_buf
+#                                      invariants (dat non-null whenever len>0) are
+#                                      structural; the analyzer treats the backing
+#                                      pointer as possibly-uninitialized in checksum
+#                                      and printk loops
+#   clang-analyzer-core.CallAndMessage -- result_T<T>{is_error,value} pattern in
+#                                      WebSocket frame parsing: the analyzer can't
+#                                      prove frame.payload is filled when
+#                                      res.is_error == false, so calls into
+#                                      ws_frame_send() with the recv'd pointer
+#                                      look like they pass an uninitialized value
+#   clang-analyzer-optin.performance.Padding -- struct layouts (e.g. tcp_conn) are
+#                                      hand-tuned for cache-line locality and RT
+#                                      determinism; reordering for size would
+#                                      regress the hot path
+CHECKS="${CHECKS:-clang-analyzer-*,bugprone-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-reserved-identifier,-bugprone-suspicious-include,-bugprone-branch-clone,-performance-no-int-to-ptr,-clang-analyzer-security.PointerSub,-clang-analyzer-security.ArrayBound,-clang-analyzer-core.UndefinedBinaryOperatorResult,-clang-analyzer-core.CallAndMessage,-clang-analyzer-optin.performance.Padding,-clang-diagnostic-keyword-macro,-clang-diagnostic-gnu-zero-variadic-macro-arguments,-clang-diagnostic-language-extension-token}"
 
 # Report header diagnostics from project headers only (not system headers)
 HEADER_FILTER="${HEADER_FILTER:-'(include/mazu|arch/riscv64/include|drivers|kernel|lib|user)/.*'}"
@@ -147,10 +171,37 @@ rc=0
 a_warnings=0
 a_errors=0
 
+# Disabled checkers for the standalone analyzer (Phase 1).  Note that
+# -Xanalyzer -analyzer-disable-checker errors hard on an unknown checker
+# name, so this list must only contain checkers the deployed clang
+# actually registers; checker names not in scope here are still
+# suppressed in CHECKS for Phase 2 (clang-tidy ignores unknown disables).
+#   core.UndefinedBinaryOperatorResult, core.uninitialized.Assign --
+#       byte_view dereference patterns in hand-rolled checksum / printk
+#       loops trip the analyzer because it can't prove the (dat,len)
+#       invariant of struct byte_view across translation units.
+#   core.CallAndMessage -- result_T pattern in WebSocket recv loop;
+#       analyzer can't prove frame.payload is initialized when
+#       res.is_error is false, so passing it to ws_frame_send() looks
+#       like an uninitialized argument.
+# security.ArrayBound is intentionally omitted here.  clang 18 (Ubuntu
+# 24.04 stock) ships it as alpha.security.ArrayBoundV2 instead, and
+# passing the new name to an older driver fails the run; the Phase 1
+# pass does not surface ArrayBound on these patterns anyway.  Phase 2
+# clang-tidy keeps -clang-analyzer-security.ArrayBound in CHECKS for
+# the newer drivers that do fire it via --header-filter.
+# Exported so the GNU-parallel branch below can reference it through env
+# rather than splicing the list into a doubly-quoted shell command.  The
+# ${VAR:-default} form mirrors CLANG_BIN/CLANG_TIDY_BIN/etc. so callers
+# can extend the list (e.g. when bringing up a new clang version that
+# fires a different false-positive checker on the same patterns).
+export ANALYZER_DISABLED_CHECKERS="${ANALYZER_DISABLED_CHECKERS:-core.UndefinedBinaryOperatorResult,core.uninitialized.Assign,core.CallAndMessage}"
+
 run_analyze() {
     local f="$1" tmp
     tmp="$(mktemp "$REPORT_DIR"/analyze.XXXXXX)"
     if ! "$CLANG_BIN" --analyze -Xanalyzer -analyzer-output=text \
+        -Xanalyzer -analyzer-disable-checker="$ANALYZER_DISABLED_CHECKERS" \
         "${clang_analyze_flags[@]}" \
         -D__BASENAME__="\"$(basename "$f")\"" "$f" \
         >"$tmp" 2>&1; then
@@ -162,9 +213,13 @@ run_analyze() {
 if [ "$JOBS" -gt 1 ] && command -v parallel >/dev/null 2>&1; then
     export CLANG_BIN REPORT_DIR
     export clang_analyze_flags_str="${clang_analyze_flags[*]}"
+    # ANALYZER_DISABLED_CHECKERS is referenced through env so an edited
+    # list (including any future entry containing whitespace) survives
+    # the parallel sub-shell quoting.
     printf '%s\n' "${c_files[@]}" | parallel -j "$JOBS" "
         tmp=\$(mktemp \"$REPORT_DIR\"/analyze.XXXXXX)
         $CLANG_BIN --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-disable-checker=\"\$ANALYZER_DISABLED_CHECKERS\" \
             ${clang_analyze_flags[*]} \
             -D__BASENAME__=\\\"\$(basename {})\\\" {} >\"\$tmp\" 2>&1 || \
             touch \"$REPORT_DIR/.analyze_fail\"
@@ -188,6 +243,13 @@ fi
 a_warnings=$(grep -c ": warning:" "$ANALYZE_LOG" || true)
 a_errors=$(grep -c ": error:" "$ANALYZE_LOG" || true)
 echo "  analyzer: ${a_warnings} warning(s), ${a_errors} error(s)"
+# Phase 1 only sets rc=1 on tool crashes (.analyze_fail). Without this
+# guard, residual warnings accumulate silently while make analyze still
+# exits 0, defeating the TODO 9w policy that any non-failing finding
+# must be recorded in a suppression list with rationale.
+if [ "$a_warnings" -gt 0 ] || [ "$a_errors" -gt 0 ]; then
+    rc=1
+fi
 
 # --- Phase 2: clang-tidy (uses compile_commands.json) -------------------------
 
@@ -220,6 +282,12 @@ done
 t_warnings=$(grep -c ": warning:" "$TIDY_LOG" || true)
 t_errors=$(grep -c ": error:" "$TIDY_LOG" || true)
 echo "  tidy: ${t_warnings} warning(s), ${t_errors} error(s)"
+# Phase 2 mirrors the Phase 1 strictness gate: clang-tidy returns 0 by
+# default even when warnings are emitted, so without this make analyze
+# would silently accumulate noise.
+if [ "$t_warnings" -gt 0 ] || [ "$t_errors" -gt 0 ]; then
+    rc=1
+fi
 
 # --- Phase 3: cppcheck (uses compile_commands.json) ---------------------------
 

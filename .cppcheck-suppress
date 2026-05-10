@@ -61,3 +61,9 @@ unreadVariable:kernel/fs/netfs.c
 # only in KTRACE appear unused in that configuration
 unreadVariable:kernel/proc/syscall.c
 unreadVariable:kernel/sched/deadline.c
+
+# kpaths is the backing storage for kfa[i].path pointers populated by
+# copy_file_actions().  spawn_apply_file_actions() runs after the if-block
+# exits, so kpaths must remain in scope at the function level even though
+# only copy_file_actions() writes through it.
+variableScope:kernel/proc/syscall.c

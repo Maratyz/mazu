@@ -20,11 +20,31 @@ if [ "${1:-}" = "--profile-matrix" ]; then
         cp .config "$backup_file"
     fi
 
+    profile_label() {
+        local spec="$1"
+        local defconfig="${spec%%|*}"
+        local fragments=""
+        if [ "$defconfig" != "$spec" ]; then
+            fragments="${spec#*|}"
+            printf '%s + [%s]\n' "$defconfig" "$fragments"
+        else
+            printf '%s\n' "$defconfig"
+        fi
+    }
+
     build_profile() {
-        local profile="$1"
+        local spec="$1"
+        local defconfig="${spec%%|*}"
+        local fragments=()
+        local label
+        label="$(profile_label "$spec")"
+        if [ "$defconfig" != "$spec" ]; then
+            # shellcheck disable=SC2206
+            fragments=(${spec#*|})
+        fi
         make clean >/dev/null
-        if ! DEFCONFIG="$profile" make defconfig >/dev/null 2>&1; then
-            echo "profile defconfig FAIL: $profile" >&2
+        if ! DEFCONFIG="$defconfig" CONFIG_FRAGMENTS="${fragments[*]-}" make defconfig >/dev/null 2>&1; then
+            echo "profile defconfig FAIL: $label" >&2
             return 1
         fi
         if ! make -j4 >/tmp/mazu.profile.build.log 2>&1; then
@@ -33,18 +53,20 @@ if [ "${1:-}" = "--profile-matrix" ]; then
             return 1
         fi
         rm -f /tmp/mazu.profile.build.log
-        echo "profile build OK: $profile"
+        echo "profile build OK: $label"
     }
 
     # Run semihosting selftests for a built kernel.  Returns 0 on pass,
     # 1 on fail, 2 if semihosting is not enabled.
     selftest_profile() {
+        local label
+        label="$(profile_label "$1")"
         if ! grep -q '^CONFIG_SEMIHOSTING=y' .config; then
-            echo "profile selftest SKIP (no semihosting): $1"
+            echo "profile selftest SKIP (no semihosting): $label"
             return 0
         fi
         if ! make check-selftest >/tmp/mazu.profile.selftest.log 2>&1; then
-            echo "profile selftest FAIL: $1" >&2
+            echo "profile selftest FAIL: $label" >&2
             tail -n 20 /tmp/mazu.profile.selftest.log >&2
             rm -f /tmp/mazu.profile.selftest.log
             return 1
@@ -53,23 +75,25 @@ if [ "${1:-}" = "--profile-matrix" ]; then
         count=$(grep -oE '[0-9]+ passed' build/check_selftest_serial.log 2>/dev/null |
             head -1 | grep -oE '[0-9]+') || true
         rm -f /tmp/mazu.profile.selftest.log
-        echo "profile selftest OK: $1 (${count:-?} tests)"
+        echo "profile selftest OK: $label (${count:-?} tests)"
     }
 
     rc=0
     build_fail=""
     selftest_fail=""
     for profile in \
-        configs/defconfig \
-        configs/rt_defconfig; do
+        "configs/defconfig" \
+        "configs/rt_defconfig" \
+        "configs/defconfig|configs/fragments/up.config" \
+        "configs/defconfig|configs/fragments/up.config configs/fragments/ubsan.config"; do
         if ! build_profile "$profile"; then
-            echo "profile build FAIL: $profile" >&2
-            build_fail="$build_fail $profile"
+            echo "profile build FAIL: $(profile_label "$profile")" >&2
+            build_fail="$build_fail $(profile_label "$profile")"
             rc=1
             continue
         fi
         if ! selftest_profile "$profile"; then
-            selftest_fail="$selftest_fail $profile"
+            selftest_fail="$selftest_fail $(profile_label "$profile")"
             rc=1
         fi
     done

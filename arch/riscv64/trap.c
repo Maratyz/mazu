@@ -25,6 +25,15 @@
 #include <mazu/sched.h>
 #include <mazu/syscall.h>
 #include <mazu/uaccess.h>
+#if CONFIG_SEMIHOSTING
+/* Forward-declare instead of #include <semihost.h>: that header defines
+ * SYS_OPEN / SYS_READ / SYS_WRITE / SYS_EXIT etc. for the semihosting
+ * ABI with different values than mazu/syscall.h's kernel syscall
+ * numbers, and including it after mazu/syscall.h triggers redefinition
+ * warnings.  semihost_exit is the only symbol we need here.
+ */
+__noreturn void semihost_exit(i32 code);
+#endif
 
 #include "../../kernel/proc/signal.h"
 
@@ -624,6 +633,14 @@ struct trap_frame *trap_dispatch(struct trap_frame *tf)
                STR("*** UBSan/ebreak trap at sepc=%lx (cpu=%lu tid=%hu) ***\n"),
                td ? active_tf->sepc : tf->sepc, (u64) pc->cpuid, (u32) tid);
         trap_dump_diagnostic(td ? active_tf : tf, pc->cpuid, pid, tid);
+#if CONFIG_SEMIHOSTING
+        /* Exit QEMU with a non-zero status so CI fails immediately on a
+         * sanitizer trip rather than waiting for the make-check timeout.
+         * halt_execution() is the fallback when semihosting is off (the
+         * call is __noreturn so the fallback is unreachable here).
+         */
+        semihost_exit(1);
+#endif
         halt_execution();
     } else {
         klog_fault_event("unexpected_trap", pc->cpuid, pid, tid, scause,

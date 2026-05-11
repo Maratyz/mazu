@@ -23,6 +23,13 @@ struct posix_timer {
     u32 overrun;
     bool armed;
     bool in_use;
+    /* SIGEV_THREAD_ID target TID. 0 selects process-directed delivery
+     * (the kernel's signal_send picks an eligible thread). Non-zero
+     * directs SIGALRM at the matching thread of the owning proc; if
+     * that thread no longer exists at expiry, fall back to process-
+     * directed delivery so the bit is not silently dropped.
+     */
+    u16 target_tid;
 };
 
 /* Allocate a timer for the given process.  Returns handle >= 0 or -EAGAIN. */
@@ -30,11 +37,13 @@ i32 posix_timer_create(struct proc *p);
 
 /* Arm a timer.  Caller must be the owner.
  * value_ms = initial expiry (0 = disarm), interval_ms = repeat (0 = one-shot).
+ * target_tid = SIGEV_THREAD_ID target (0 = process-directed).
  */
 i32 posix_timer_settime(i32 handle,
                         struct proc *caller,
                         u64 value_ms,
-                        u64 interval_ms);
+                        u64 interval_ms,
+                        u16 target_tid);
 
 /* Disarm and delete a timer.  Caller must be the owner. */
 i32 posix_timer_delete(i32 handle, struct proc *caller);

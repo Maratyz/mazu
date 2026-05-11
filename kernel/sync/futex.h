@@ -59,6 +59,14 @@ i64 futex_unlock_pi(ptr uaddr);
  * futex word and wakes one waiter per entry.
  */
 struct proc;
+struct sched_task;
 void futex_exit_robust_list(struct proc *p);
+
+/* Walk one thread's robust futex list and clear its registration.
+ * Used by SYS_THREAD_EXIT for non-last-thread exits, where the
+ * dying thread must release its own held futexes without tearing
+ * down the rest of the process.
+ */
+void futex_exit_robust_list_task(struct sched_task *td);
 
 #endif /* MAZU_FUTEX_H */

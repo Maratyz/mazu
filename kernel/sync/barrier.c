@@ -110,7 +110,8 @@ i32 barrier_wait_interruptible(struct barrier *b)
     sched_set_block_cleanup(w.task, barrier_wait_cleanup, &cleanup);
 
     while (b->generation == w.wait_gen) {
-        if (signal_pending_current()) {
+        i32 abort = wait_abort_error_current();
+        if (abort < 0) {
             list_del_init(&w.node);
             sched_clear_block_cleanup(w.task);
             if (w.task->state == TD_STATE_BLOCKED)
@@ -119,7 +120,7 @@ i32 barrier_wait_interruptible(struct barrier *b)
             b->active_waiters--;
             spin_unlock_irqrestore(&b->lock, flags);
             lockdep_release(LOCK_LEVEL_WAITQ);
-            return -(i32) EINTR;
+            return abort;
         }
         spin_unlock_irqrestore(&b->lock, flags);
         lockdep_release(LOCK_LEVEL_WAITQ);

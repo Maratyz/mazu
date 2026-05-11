@@ -7,19 +7,15 @@
  * Lock ordering (global): wq->lock -> pcpu_runq_lock (never reversed).
  */
 
-#ifndef MAZU_WAITQUEUE_H
-#define MAZU_WAITQUEUE_H
+#ifndef MAZU_KERNEL_WAITQUEUE_H
+#define MAZU_KERNEL_WAITQUEUE_H
 
 #include <mazu/list.h>
 #include <mazu/sched.h>
 #include <mazu/spinlock.h>
+#include <mazu/waitqueue.h>
 
 struct sched_task; /* forward declaration */
-
-struct wait_queue_head {
-    spinlock_t lock;
-    struct list_head head;
-};
 
 enum wait_unblock_reason {
     WAIT_UNBLOCK_NONE = 0,
@@ -39,11 +35,6 @@ struct wait_queue_entry {
     struct callout *timeout_callout; /* armed stack-local callout to cancel
                                         on task death; NULL if no timeout */
 };
-
-#define WAIT_QUEUE_HEAD_INITIALIZER(name)                                    \
-    {                                                                        \
-        .lock = SPINLOCK_INITIALIZER, .head = { &(name).head, &(name).head } \
-    }
 
 void init_waitqueue_head(struct wait_queue_head *wq);
 void prepare_to_wait(struct wait_queue_head *wq, struct wait_queue_entry *e);
@@ -102,4 +93,4 @@ void wait_timeout_fn(void *arg);
 /* Internal helper for wait_event macro; do not call directly. */
 struct sched_task *__wq_current_task(void);
 
-#endif /* MAZU_WAITQUEUE_H */
+#endif /* MAZU_KERNEL_WAITQUEUE_H */

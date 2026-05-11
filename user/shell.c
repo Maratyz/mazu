@@ -616,11 +616,27 @@ static void cmd_kill(struct shell_session *sess, struct str pid_str)
     }
 
     p->exit_code = -1;
-    if (p->task) {
-        p->task->proc = NULL;
-        sched_set_task_state(p->task, TD_STATE_TERMINATING);
+    /* Mark every live thread as terminating, then detach.  Hold proc_table_lock
+     * so signal_send on another hart cannot read a torn tasks[] view while we
+     * walk and clear it.  With one thread per process today this is a single
+     * iteration; the loop is structural for the multi-thread future.
+     *
+     * NOTE: this path bypasses proc_exit() and therefore leaks robust-futex
+     * unwind, armed POSIX timers, and sync handles. The existing pre-refactor
+     * cmd_kill had the same shortcut; switching to signal_send(p, SIGKILL) is
+     * a known follow-up but out of scope for the proc-model refactor.
+     */
+    {
+        u64 pflags = proc_table_lock_irqsave();
+        for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+            struct sched_task *td = p->tasks[i];
+            if (td) {
+                sched_set_task_state(td, TD_STATE_TERMINATING);
+                proc_detach_task(p, td);
+            }
+        }
+        proc_table_unlock_irqrestore(pflags);
     }
-    p->task = NULL;
     bool is_orphan = proc_is_missing_or_zombie(p->parent_pid);
     proc_set_state(p, PROC_STATE_ZOMBIE);
     if (is_orphan)

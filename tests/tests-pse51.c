@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* PSE51 conformance smoke tests (item 15g).
+/* PSE51 conformance smoke tests.
  *
  * Exercises the PSE51-facing surface: clocks, sleep, sync primitives,
  * scheduling control, barriers, rwlocks, message queues.

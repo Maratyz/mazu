@@ -135,8 +135,9 @@ i64 futex_wait(ptr uaddr, u32 expected)
     spin_unlock_irqrestore(&w.bucket->lock, flags);
     lockdep_release(LOCK_LEVEL_WAITQ);
 
-    if (signal_pending_current())
-        return -(i64) EINTR;
+    i32 abort = wait_abort_error_current();
+    if (abort < 0)
+        return (i64) abort;
     return 0;
 }
 
@@ -312,8 +313,9 @@ i64 futex_lock_pi(ptr uaddr)
     spin_unlock_irqrestore(&w.bucket->lock, flags);
     lockdep_release(LOCK_LEVEL_WAITQ);
 
-    if (signal_pending_current())
-        return -(i64) EINTR;
+    i32 abort = wait_abort_error_current();
+    if (abort < 0)
+        return (i64) abort;
     return 0;
 }
 
@@ -443,18 +445,38 @@ static void futex_handle_robust_entry(ptr entry, i32 futex_offset)
     futex_wake(futex_addr, 1);
 }
 
-void futex_exit_robust_list(struct proc *p)
+/* Walk one thread's robust list and unlock its orphaned futexes,
+ * then clear that thread's registration.  Snapshots the per-task
+ * registration locally so the user-space walk runs without holding
+ * any lock; copy_from_user can take a page fault and the kernel must
+ * not be inside a spinlock or interrupts-disabled region when that
+ * happens.
+ */
+void futex_exit_robust_list_task(struct sched_task *td)
 {
-    if (!p || p->robust_list_head == 0)
+    if (!td)
         return;
 
-    ptr head = p->robust_list_head;
-    i32 offset = p->robust_futex_offset;
-    ptr pending = p->robust_pending;
+    ptr head, pending;
+    i32 offset;
+
+    /* Snapshot under proc_table_lock against concurrent writers. */
+    u64 lflags = proc_table_lock_irqsave();
+    head = td->td_robust_list_head;
+    offset = td->td_robust_futex_offset;
+    pending = td->td_robust_pending;
+    /* Clear under the same lock so an SMP racer cannot see them. */
+    td->td_robust_list_head = 0;
+    td->td_robust_futex_offset = 0;
+    td->td_robust_pending = 0;
+    proc_table_unlock_irqrestore(lflags);
 
     /* Handle the pending entry first (may not be in the list). */
     if (pending != 0)
         futex_handle_robust_entry(pending, offset);
+
+    if (head == 0)
+        return;
 
     /* Walk the linked list.  Each entry's first sizeof(ptr) bytes
      * is a pointer to the next entry (like Linux robust_list.next).
@@ -478,11 +500,29 @@ void futex_exit_robust_list(struct proc *p)
         if (entry == head)
             break;
     }
+}
 
-    /* Clear the process's robust list state. */
-    p->robust_list_head = 0;
-    p->robust_futex_offset = 0;
-    p->robust_pending = 0;
+void futex_exit_robust_list(struct proc *p)
+{
+    if (!p)
+        return;
+
+    /* Snapshot the task pointer set under proc_table_lock, then
+     * walk each task's list with the lock dropped. The tasks
+     * themselves cannot be freed during this walk because proc_exit
+     * is the sole detacher and proc_exit is the caller. The
+     * structure scales with PROC_THREAD_MAX iterations.
+     */
+    struct sched_task *snap[PROC_THREAD_MAX];
+    u64 flags = proc_table_lock_irqsave();
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++)
+        snap[i] = p->tasks[i];
+    proc_table_unlock_irqrestore(flags);
+
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        if (snap[i])
+            futex_exit_robust_list_task(snap[i]);
+    }
 }
 
 static void futex_init_hook(u32 lifecycle_flag __unused)

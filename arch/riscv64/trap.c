@@ -25,6 +25,7 @@
 #include <mazu/sched.h>
 #include <mazu/syscall.h>
 #include <mazu/uaccess.h>
+
 #if CONFIG_SEMIHOSTING
 /* Forward-declare instead of #include <semihost.h>: that header defines
  * SYS_OPEN / SYS_READ / SYS_WRITE / SYS_EXIT etc. for the semihosting
@@ -583,8 +584,27 @@ struct trap_frame *trap_dispatch(struct trap_frame *tf)
 
         if (scause == SCAUSE_INST_PAGE_FAULT && td &&
             !(tf->sstatus & SSTATUS_SPP) && td->proc &&
-            signal_handle_trampoline_fault(td->proc, active_tf))
+            signal_handle_trampoline_fault(td, active_tf))
             goto schedule_decision;
+
+        /* Thread-exit trampoline: a user thread that returns from its entry
+         * function pops ra into pc and the unmapped trampoline page faults
+         * here. Translate into a clean SYS_THREAD_EXIT(0). Both the PC and
+         * the s11 magic must match: s11 is callee-saved across function calls
+         * in the RISC-V ABI, so a clean implicit return preserves the value we
+         * stamped at thread creation. A wild-pointer jump that happens to land
+         * on the trampoline PC will not have s11 preserved and falls through to
+         * the normal user-fault path with a diagnostic dump.
+         */
+        if (scause == SCAUSE_INST_PAGE_FAULT && td &&
+            !(tf->sstatus & SSTATUS_SPP) && td->proc &&
+            active_tf->sepc == (u64) thread_exit_trampoline_pc(td->proc) &&
+            active_tf->s11 == THREAD_EXIT_TRAMPOLINE_MAGIC) {
+            active_tf->a7 = SYS_THREAD_EXIT;
+            active_tf->a0 = 0;
+            (void) syscall_dispatch(active_tf, td);
+            goto schedule_decision;
+        }
 
         /* If the fault came from user mode, kill the process instead of
          * panicking the whole kernel.
@@ -593,16 +613,7 @@ struct trap_frame *trap_dispatch(struct trap_frame *tf)
             klog_fault_event("user_page_fault", pc->cpuid, pid, tid, scause,
                              tf->sepc, tf->stval, tf->sstatus);
             trap_dump_diagnostic(active_tf, pc->cpuid, pid, tid);
-            td->proc->exit_code = -1;
-            td->proc->task = NULL;
-            struct proc *parent = proc_find(td->proc->parent_pid);
-            bool is_orphan = !parent || parent->state == PROC_STATE_ZOMBIE;
-            proc_set_state(td->proc, PROC_STATE_ZOMBIE);
-            if (is_orphan)
-                proc_free(td->proc);
-            else
-                proc_notify_parent(td->proc);
-            td->proc = NULL;
+            proc_exit(td->proc, -1);
             sched_set_task_state(td, TD_STATE_TERMINATING);
         } else if (td && !td->must_not_exit && td->callback) {
             /* Kernel task fault from a non-critical task: kill the task rather
@@ -634,10 +645,10 @@ struct trap_frame *trap_dispatch(struct trap_frame *tf)
                td ? active_tf->sepc : tf->sepc, (u64) pc->cpuid, (u32) tid);
         trap_dump_diagnostic(td ? active_tf : tf, pc->cpuid, pid, tid);
 #if CONFIG_SEMIHOSTING
-        /* Exit QEMU with a non-zero status so CI fails immediately on a
-         * sanitizer trip rather than waiting for the make-check timeout.
-         * halt_execution() is the fallback when semihosting is off (the
-         * call is __noreturn so the fallback is unreachable here).
+        /* Exit QEMU with a non-zero status so CI fails immediately on sanitizer
+         * trip rather than waiting for the make-check timeout. halt_execution()
+         * is the fallback when semihosting is off (the call is __noreturn so
+         * the fallback is unreachable here).
          */
         semihost_exit(1);
 #endif
@@ -654,9 +665,8 @@ struct trap_frame *trap_dispatch(struct trap_frame *tf)
      * that the handler is invoked in the correct task context.
      */
     if (td && td->proc && td->state != TD_STATE_TERMINATING &&
-        !(active_tf->sstatus & SSTATUS_SPP) &&
-        signal_has_deliverable(td->proc)) {
-        signal_deliver(td->proc, active_tf);
+        !(active_tf->sstatus & SSTATUS_SPP) && signal_needs_trap_exit(td)) {
+        signal_deliver(td, active_tf);
     }
 
 /* Scheduler decision */

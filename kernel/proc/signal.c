@@ -21,12 +21,10 @@
 
 void signal_init(struct signal_state *ss)
 {
-    ss->pending = 0;
-    ss->blocked = 0;
-    ss->frame_top = (ptr) 0;
-    ss->frame_prev = (ptr) 0;
-    ss->frame_cookie = 0;
-    ss->frame_prev_cookie = 0;
+    /* Per-task signal state (pending/blocked/frame_*) is zeroed at
+     * task creation in sched_create_user_task; this initializer is
+     * for the per-process disposition table only.
+     */
     for (i32 i = 0; i < SIG_MAX; i++) {
         ss->actions[i].handler = SIG_DFL;
         ss->actions[i].sa_mask = 0;
@@ -37,11 +35,6 @@ void signal_init(struct signal_state *ss)
 static inline bool sig_valid(i32 signo)
 {
     return signo > 0 && signo < SIG_MAX;
-}
-
-static inline u32 sig_bit(i32 signo)
-{
-    return 1U << signo;
 }
 
 static inline bool signal_restore_tf_valid(struct proc *p,
@@ -94,46 +87,107 @@ static void signal_interrupt_task(struct sched_task *td)
         sched_wake_sleeping(td);
 }
 
+/* True if this thread is alive enough to receive a signal: attached
+ * to its proc, not in a dying join state, and not already terminating
+ * for unrelated reasons.
+ */
+static bool signal_thread_is_alive(const struct sched_task *td)
+{
+    if (!td)
+        return false;
+    if (td->td_join_state == TD_JOIN_EXITED ||
+        td->td_join_state == TD_JOIN_REAPED)
+        return false;
+    if (td->state == TD_STATE_TERMINATING)
+        return false;
+    return true;
+}
+
+static bool signal_thread_waits_for_signo(const struct sched_task *td,
+                                          i32 signo)
+{
+    return td && signo > 0 && signo < SIG_MAX &&
+           (__atomic_load_n(&td->td_sig.sigwait_set, __ATOMIC_RELAXED) &
+            sig_bit(signo)) != 0;
+}
+
+/* Pick a thread to nudge (wake / interrupt) so a process-directed
+ * signal is observed promptly. Used purely as a wakeup hint; the bit
+ * itself lives on proc->sig_state.proc_pending and is observable by
+ * any thread when it returns to user space. Returns NULL if no live
+ * thread is found.
+ */
+static struct sched_task *signal_pick_wake_target_locked(struct proc *p,
+                                                         i32 signo)
+{
+    if (!p)
+        return NULL;
+    bool unmaskable = (signo == SIGKILL);
+    struct sched_task *leader = proc_thread_group_leader(p);
+    if (!unmaskable && signal_thread_is_alive(leader) &&
+        signal_thread_waits_for_signo(leader, signo))
+        return leader;
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *td = p->tasks[i];
+        if (td == leader || !signal_thread_is_alive(td))
+            continue;
+        if (signal_thread_waits_for_signo(td, signo))
+            return td;
+    }
+    if (signal_thread_is_alive(leader) &&
+        (unmaskable || signal_thread_can_deliver(leader, signo)))
+        return leader;
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *td = p->tasks[i];
+        if (td == leader || !signal_thread_is_alive(td))
+            continue;
+        if (unmaskable || signal_thread_can_deliver(td, signo))
+            return td;
+    }
+    return signal_thread_is_alive(leader) ? leader : NULL;
+}
+
 i32 signal_send(struct proc *p, i32 signo)
 {
     if (!p || !sig_valid(signo))
         return -(i32) EINVAL;
 
-    u64 flags = proc_sig_lock_irqsave(p);
-
-    /* SIGKILL cannot be masked or ignored. */
-    if (signo == SIGKILL) {
-        p->sig_state.pending |= sig_bit(SIGKILL);
-        proc_sig_unlock_irqrestore(p, flags);
-
-        /* Snapshot p->task under proc_table_lock — same lock that
-         * proc_exit uses to detach p->task.
-         */
-        u64 tflags = proc_table_lock_irqsave();
-        struct sched_task *td = p->task;
-        proc_table_unlock_irqrestore(tflags);
-
-        proc_exit(p, -SIGKILL);
-        if (td)
-            sched_set_task_state(td, TD_STATE_TERMINATING);
-        return 0;
-    }
-
-    p->sig_state.pending |= sig_bit(signo);
-    proc_sig_unlock_irqrestore(p, flags);
-
-    /* Snapshot p->task under proc_table_lock.  proc_exit detaches
-     * p->task under this same lock, so reading here guarantees the
-     * pointer is either valid (task still alive) or NULL (already
-     * detached).  We must not dereference td after releasing the lock
-     * without first checking it is non-NULL.
+    /* Process-directed: write the bit into the per-proc pending mask
+     * (not into any single thread's td_sig.pending). At return-to-user
+     * each thread folds proc_pending into its delivery view, so the
+     * signal survives the picked thread exiting before delivery.
+     *
+     * The picked target here is just for the wakeup hint -- if it has
+     * exited by the time anyone returns to user space, some other
+     * live thread will still observe the bit via signal_has_deliverable.
      */
+    bool need_kill = false;
+    bool delivered = false;
+
     u64 tflags = proc_table_lock_irqsave();
-    struct sched_task *td = p->task;
+    if (p->state != PROC_STATE_FREE && p->state != PROC_STATE_ZOMBIE) {
+        u64 sflags = proc_sig_lock_irqsave(p);
+        __atomic_or_fetch(&p->sig_state.proc_pending, sig_bit(signo),
+                          __ATOMIC_RELAXED);
+        proc_sig_unlock_irqrestore(p, sflags);
+        delivered = true;
+        if (signo == SIGKILL)
+            need_kill = true;
+        else
+            signal_interrupt_task(signal_pick_wake_target_locked(p, signo));
+    }
     proc_table_unlock_irqrestore(tflags);
 
-    signal_interrupt_task(td);
+    if (!delivered)
+        return 0;
 
+    if (need_kill) {
+        /* proc_exit is idempotent: it checks state under its own
+         * proc_table_lock and bails if the proc is already exiting.
+         */
+        proc_exit(p, -SIGKILL);
+        return 0;
+    }
     return 0;
 }
 
@@ -148,14 +202,38 @@ struct signal_frame {
     i32 signo;
 };
 
-bool signal_deliver(struct proc *p, struct trap_frame *tf)
+bool signal_deliver(struct sched_task *td, struct trap_frame *tf)
 {
-    if (!p)
+    if (!td)
+        return false;
+    /* Snapshot td->proc under proc_table_lock so a concurrent
+     * proc_exit on another hart cannot detach the back-pointer
+     * mid-function. After the snapshot, the proc memory itself is
+     * stable (proc_table[] is statically allocated; only state and
+     * magic transition). Bail if magic was poisoned by proc_free.
+     */
+    struct proc *p;
+    {
+        u64 tflags = proc_table_lock_irqsave();
+        p = td->proc;
+        proc_table_unlock_irqrestore(tflags);
+    }
+    if (!p || p->magic != PROC_MAGIC)
         return false;
 
     u64 flags = proc_sig_lock_irqsave(p);
-    u32 deliverable = p->sig_state.pending & ~p->sig_state.blocked;
+    /* Fold the per-proc pending mask into this thread's delivery
+     * view so a process-directed signal whose original wake target
+     * has since exited still gets observed by a surviving thread.
+     */
+    u32 thread_pending = td->td_sig.pending;
+    u32 proc_pending = p->sig_state.proc_pending;
+    u32 deliverable = (thread_pending | proc_pending) & ~td->td_sig.blocked;
     if (deliverable == 0) {
+        if (td->td_sig.sigsuspend_active) {
+            td->td_sig.blocked = td->td_sig.sigsuspend_saved_blocked;
+            td->td_sig.sigsuspend_active = false;
+        }
         proc_sig_unlock_irqrestore(p, flags);
         return false;
     }
@@ -173,16 +251,34 @@ bool signal_deliver(struct proc *p, struct trap_frame *tf)
         return false;
     }
 
-    p->sig_state.pending &= ~sig_bit(signo);
+    /* Claim the bit. Prefer to take it off the per-thread mask if it was set
+     * there (so a thread-directed delivery does not also clear the process-wide
+     * bit and starve other threads); otherwise clear it from proc_pending. The
+     * two masks may both have the bit if a sender wrote proc_pending and a
+     * thread later self-targeted.
+     */
+    if (thread_pending & sig_bit(signo))
+        td->td_sig.pending &= ~sig_bit(signo);
+    else
+        p->sig_state.proc_pending &= ~sig_bit(signo);
     sig_handler_fn_t handler = p->sig_state.actions[signo].handler;
 
     if (handler == SIG_IGN) {
+        /* Restore the pre-sigsuspend mask if this thread was parked in
+         * sigsuspend: the signal was dequeued but no handler ran, and POSIX
+         * requires the original mask to be effective when sigsuspend returns
+         * -EINTR. Doing this under sig_lock keeps the lockless reader
+         *  (signal_has_deliverable) consistent.
+         */
+        if (td->td_sig.sigsuspend_active) {
+            td->td_sig.blocked = td->td_sig.sigsuspend_saved_blocked;
+            td->td_sig.sigsuspend_active = false;
+        }
         proc_sig_unlock_irqrestore(p, flags);
         return false;
     }
 
     if (handler == SIG_DFL) {
-        struct sched_task *td = p->task;
         proc_sig_unlock_irqrestore(p, flags);
         /* Default: terminate (except SIGCHLD which is ignored). */
         if (signo == SIGCHLD)
@@ -190,42 +286,51 @@ bool signal_deliver(struct proc *p, struct trap_frame *tf)
         pr_info(STR("signal: pid=%hu terminated by signal %d\n"), p->pid,
                 signo);
         proc_exit(p, -signo);
-        if (td)
-            sched_set_task_state(td, TD_STATE_TERMINATING);
+        sched_set_task_state(td, TD_STATE_TERMINATING);
         return true;
     }
 
-    /* Custom handler: push signal frame onto user stack. */
+    /* Custom handler: push signal frame onto user stack.
+     *
+     * If the thread is in sigsuspend, the frame.saved_blocked snapshot must
+     * capture the ORIGINAL pre-suspend mask, not the temporary suspend mask.
+     * sigreturn restores from frame.saved_blocked, so this is what makes
+     * sigsuspend POSIX-correct: the handler runs with sa_mask + signo blocked
+     * on top of the suspend mask, and after sigreturn the original mask is back
+     * in effect.
+     */
     u64 sp = tf->sp;
     sp -= sizeof(struct signal_frame);
     sp &= ~0xFUL;
 
+    u32 frame_saved_blocked = td->td_sig.sigsuspend_active
+                                  ? td->td_sig.sigsuspend_saved_blocked
+                                  : td->td_sig.blocked;
     struct signal_frame frame = {
         .magic = SIGNAL_FRAME_MAGIC,
-        .cookie = p->sig_state.frame_cookie + 1,
+        .cookie = td->td_sig.frame_cookie + 1,
         .saved_tf = *tf,
-        .saved_blocked = p->sig_state.blocked,
-        .prev_frame = p->sig_state.frame_top,
-        .prev_cookie = p->sig_state.frame_cookie,
+        .saved_blocked = frame_saved_blocked,
+        .prev_frame = td->td_sig.frame_top,
+        .prev_cookie = td->td_sig.frame_cookie,
         .signo = signo,
     };
+    if (td->td_sig.sigsuspend_active)
+        td->td_sig.sigsuspend_active = false;
 
-    p->sig_state.blocked |=
-        p->sig_state.actions[signo].sa_mask | sig_bit(signo);
-    p->sig_state.frame_prev = frame.prev_frame;
-    p->sig_state.frame_prev_cookie = frame.prev_cookie;
-    p->sig_state.frame_top = (ptr) sp;
-    p->sig_state.frame_cookie = frame.cookie;
+    td->td_sig.blocked |= p->sig_state.actions[signo].sa_mask | sig_bit(signo);
+    td->td_sig.frame_prev = frame.prev_frame;
+    td->td_sig.frame_prev_cookie = frame.prev_cookie;
+    td->td_sig.frame_top = (ptr) sp;
+    td->td_sig.frame_cookie = frame.cookie;
     proc_sig_unlock_irqrestore(p, flags);
 
     i64 rc = copy_to_user((ptr) sp, &frame, sizeof(frame));
     if (rc < 0) {
-        struct sched_task *td = p->task;
         pr_info(STR("signal: pid=%hu stack fault during signal %d\n"), p->pid,
                 signo);
         proc_exit(p, -signo);
-        if (td)
-            sched_set_task_state(td, TD_STATE_TERMINATING);
+        sched_set_task_state(td, TD_STATE_TERMINATING);
         return true;
     }
 
@@ -239,9 +344,17 @@ bool signal_deliver(struct proc *p, struct trap_frame *tf)
     return true;
 }
 
-i32 signal_return(struct proc *p, struct trap_frame *tf)
+i32 signal_return(struct sched_task *td, struct trap_frame *tf)
 {
-    if (!p)
+    if (!td)
+        return -(i32) EPERM;
+    struct proc *p;
+    {
+        u64 tflags = proc_table_lock_irqsave();
+        p = td->proc;
+        proc_table_unlock_irqrestore(tflags);
+    }
+    if (!p || p->magic != PROC_MAGIC)
         return -(i32) EPERM;
 
     ptr frame_ptr = (ptr) tf->a0;
@@ -250,38 +363,52 @@ i32 signal_return(struct proc *p, struct trap_frame *tf)
     if (rc < 0)
         return -(i32) EFAULT;
 
-    /* Validate the saved trap frame BEFORE committing any signal state
-     * changes.  A malicious handler could supply a frame with valid
-     * magic/cookie but an invalid saved_tf; committing first would
-     * corrupt the frame stack and signal mask.
+    /* Validate the saved trap frame BEFORE committing any signal state changes.
+     * A malicious handler could supply a frame with valid magic/cookie but an
+     * invalid saved_tf; committing first would corrupt the frame stack and
+     * signal mask.
      */
     if (!signal_restore_tf_valid(p, &frame.saved_tf))
         return -(i32) EPERM;
 
     u64 flags = proc_sig_lock_irqsave(p);
     bool frame_ok = frame.magic == SIGNAL_FRAME_MAGIC &&
-                    frame_ptr == p->sig_state.frame_top &&
-                    frame.cookie == p->sig_state.frame_cookie;
+                    frame_ptr == td->td_sig.frame_top &&
+                    frame.cookie == td->td_sig.frame_cookie;
     if (!frame_ok) {
         proc_sig_unlock_irqrestore(p, flags);
         return -(i32) EPERM;
     }
-    p->sig_state.frame_top = frame.prev_frame;
-    p->sig_state.frame_cookie = frame.prev_cookie;
-    p->sig_state.frame_prev = (ptr) 0;
-    p->sig_state.frame_prev_cookie = 0;
-    p->sig_state.blocked = frame.saved_blocked;
+    td->td_sig.frame_top = frame.prev_frame;
+    td->td_sig.frame_cookie = frame.prev_cookie;
+    td->td_sig.frame_prev = (ptr) 0;
+    td->td_sig.frame_prev_cookie = 0;
+    td->td_sig.blocked = frame.saved_blocked;
     proc_sig_unlock_irqrestore(p, flags);
 
     signal_restore_tf(tf, &frame.saved_tf);
     return 0;
 }
 
-bool signal_handle_trampoline_fault(struct proc *p, struct trap_frame *tf)
+bool signal_handle_trampoline_fault(struct sched_task *td,
+                                    struct trap_frame *tf)
 {
-    if (!p || !tf || tf->sepc != (u64) signal_trampoline_pc(p))
+    if (!td || !tf)
+        return false;
+    struct proc *p;
+    {
+        u64 tflags = proc_table_lock_irqsave();
+        p = td->proc;
+        proc_table_unlock_irqrestore(tflags);
+    }
+    /* Defensive magic check: if proc_free poisoned the slot between the
+     * unlock and this read, va_stack_top inside signal_trampoline_pc would
+     * be stale.  Matches the guards in signal_deliver / signal_return.
+     */
+    if (!p || p->magic != PROC_MAGIC ||
+        tf->sepc != (u64) signal_trampoline_pc(p))
         return false;
 
     tf->a0 = tf->sp;
-    return signal_return(p, tf) == 0;
+    return signal_return(td, tf) == 0;
 }

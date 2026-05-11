@@ -2,6 +2,7 @@
 #include <mazu/selftest.h>
 #include <mazu/syscall.h>
 #include <mazu/uaccess.h>
+#include "../kernel/sync/futex.h"
 
 static struct proc *alloc_running_proc(void)
 {
@@ -40,7 +41,17 @@ static bool alloc_proc_and_task(struct proc **out_p, struct sched_task **out_td)
         return false;
     }
     td->proc = p;
-    p->task = td;
+    {
+        u64 pflags = proc_table_lock_irqsave();
+        bool ok = proc_attach_task(p, td);
+        proc_table_unlock_irqrestore(pflags);
+        if (!ok) {
+            free_mock_task(td);
+            proc_set_state(p, PROC_STATE_ZOMBIE);
+            proc_free(p);
+            return false;
+        }
+    }
     *out_p = p;
     *out_td = td;
     return true;
@@ -52,6 +63,36 @@ static void free_proc_and_task(struct proc *p, struct sched_task *td)
     proc_set_state(p, PROC_STATE_ZOMBIE);
     proc_free(p);
     free_mock_task(td);
+}
+
+static bool attach_mock_thread(struct proc *p, struct sched_task *target)
+{
+    u8 slot = PROC_THREAD_MAX;
+    u64 flags = proc_table_lock_irqsave();
+    bool ok = proc_reserve_thread_slot(p, &slot);
+    proc_table_unlock_irqrestore(flags);
+    if (!ok)
+        return false;
+    flags = proc_table_lock_irqsave();
+    ok = proc_attach_task_slot(p, target, slot);
+    proc_table_unlock_irqrestore(flags);
+    return ok;
+}
+
+static bool proc_has_thread_tid(struct proc *p, u16 tid)
+{
+    bool found = false;
+
+    u64 flags = proc_table_lock_irqsave();
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *task = p->tasks[i];
+        if (task && task->id == tid) {
+            found = true;
+            break;
+        }
+    }
+    proc_table_unlock_irqrestore(flags);
+    return found;
 }
 
 static i32 selftest_sys_open_emfile(void)
@@ -164,6 +205,41 @@ static i32 selftest_syscall_needs_proc_new_handlers(void)
 }
 DEFINE_SELFTEST(syscall_needs_proc_new_handlers,
                 selftest_syscall_needs_proc_new_handlers);
+
+static i32 selftest_robust_pending_without_head(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (137UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    ptr next = 0;
+    u32 futex_word = 123;
+    assert(copy_to_user(va, &next, sizeof(next)) == 0);
+    assert(copy_to_user(va + sizeof(ptr), &futex_word, sizeof(futex_word)) ==
+           0);
+
+    td->td_robust_list_head = 0;
+    td->td_robust_futex_offset = (i32) sizeof(ptr);
+    td->td_robust_pending = va;
+
+    futex_exit_robust_list_task(td);
+
+    u32 out = U32_MAX;
+    assert(copy_from_user(&out, va + sizeof(ptr), sizeof(out)) == 0);
+    assert(out == 0x40000000U);
+    assert(td->td_robust_list_head == 0);
+    assert(td->td_robust_futex_offset == 0);
+    assert(td->td_robust_pending == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(robust_pending_without_head,
+                selftest_robust_pending_without_head);
 
 static i32 selftest_syscall_allow_mask(void)
 {
@@ -531,6 +607,305 @@ static i32 selftest_sysconf_invalid(void)
 }
 DEFINE_SELFTEST(sysconf_invalid, selftest_sysconf_invalid);
 
+/* PSE51 option reporting: present features advertise their
+ * _POSIX_* feature-test value, absent features return -1.
+ */
+static i32 selftest_sysconf_pse51_present(void)
+{
+    assert(_POSIX_FSYNC == 200809L);
+    assert(sys_sysconf_query(_SC_TIMERS) == _POSIX_TIMERS);
+    assert(sys_sysconf_query(_SC_MONOTONIC_CLOCK) == _POSIX_MONOTONIC_CLOCK);
+    assert(sys_sysconf_query(_SC_PRIORITY_SCHEDULING) ==
+           _POSIX_PRIORITY_SCHEDULING);
+    assert(sys_sysconf_query(_SC_SEMAPHORES) == _POSIX_SEMAPHORES);
+    assert(sys_sysconf_query(_SC_BARRIERS) == _POSIX_BARRIERS);
+    assert(sys_sysconf_query(_SC_READER_WRITER_LOCKS) ==
+           _POSIX_READER_WRITER_LOCKS);
+    assert(sys_sysconf_query(_SC_THREAD_PRIORITY_INHERIT) ==
+           _POSIX_THREAD_PRIO_INHERIT);
+    assert(sys_sysconf_query(_SC_MESSAGE_PASSING) == _POSIX_MESSAGE_PASSING);
+    assert(sys_sysconf_query(_SC_THREADS) == _POSIX_THREADS);
+    assert(sys_sysconf_query(_SC_THREAD_CPUTIME) == _POSIX_THREAD_CPUTIME);
+    assert(sys_sysconf_query(_SC_CPUTIME) == _POSIX_CPUTIME);
+    assert(sys_sysconf_query(_SC_REALTIME_SIGNALS) == _POSIX_REALTIME_SIGNALS);
+    return 0;
+}
+DEFINE_SELFTEST(sysconf_pse51_present, selftest_sysconf_pse51_present);
+
+static i32 selftest_sysconf_pse51_absent(void)
+{
+    /* Features intentionally absent: option reporting must return -1
+     * (POSIX-style "absent") rather than -EINVAL. _SC_SPIN_LOCKS is
+     * here because the userspace pthread_spin_* surface is not
+     * exposed; advertising the macro would let an app gate on
+     * _POSIX_SPIN_LOCKS and call absent APIs. _SC_CLOCK_SELECTION
+     * is absent because clock_nanosleep is not exposed.
+     */
+    assert(sys_sysconf_query(_SC_SPIN_LOCKS) == -1);
+    assert(sys_sysconf_query(_SC_CLOCK_SELECTION) == -1);
+    return 0;
+}
+DEFINE_SELFTEST(sysconf_pse51_absent, selftest_sysconf_pse51_absent);
+
+/* SYS_NANOSLEEP argument validation: the kernel rejects bad timespec
+ * values with EINVAL before calling into sleep_ms.  The EINTR remainder
+ * path is exercised in higher-level integration tests because
+ * deterministically interrupting sleep_ms from a selftest task requires
+ * cross-task signal delivery.
+ */
+static i32 selftest_nanosleep_einval(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    /* Map a user page for the timespec.  Use the same pattern as
+     * selftest_sys_sched_getaffinity_success: a page in the user data
+     * region with PT-flag permissions.
+     */
+    const vaddr_t va = USER_DATA_BASE + (130UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_NANOSLEEP;
+    tf.a0 = (u64) va;
+    tf.a1 = 0;
+
+    /* Negative tv_sec. */
+    struct timespec bad = {.tv_sec = -1, .tv_nsec = 0};
+    assert(copy_to_user(va, &bad, sizeof(bad)) == 0);
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Negative tv_nsec. */
+    bad.tv_sec = 0;
+    bad.tv_nsec = -1;
+    assert(copy_to_user(va, &bad, sizeof(bad)) == 0);
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* tv_nsec >= NSEC_PER_SEC. */
+    bad.tv_sec = 0;
+    bad.tv_nsec = (i64) NSEC_PER_SEC;
+    assert(copy_to_user(va, &bad, sizeof(bad)) == 0);
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* tv_sec near INT64_MAX must not be allowed to overflow the ns/ms
+     * conversions. The kernel caps tv_sec at U64_MAX / NSEC_PER_SEC; any
+     * value above that returns EINVAL.
+     */
+    bad.tv_sec = I64_MAX;
+    bad.tv_nsec = 0;
+    assert(copy_to_user(va, &bad, sizeof(bad)) == 0);
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(nanosleep_einval, selftest_nanosleep_einval);
+
+/* mlock / munlock no-op coverage: argument validation runs but the
+ * page tables are untouched.
+ */
+static i32 selftest_mlock_munlock(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    /* Map a page so user_addr_valid succeeds for a real range. */
+    const vaddr_t va = USER_DATA_BASE + (131UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+
+    /* Empty range -> EINVAL. */
+    tf.a7 = SYS_MLOCK;
+    tf.a0 = (u64) va;
+    tf.a1 = 0;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+    tf.a7 = SYS_MUNLOCK;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Wrap-around -> EINVAL. */
+    tf.a7 = SYS_MLOCK;
+    tf.a0 = U64_MAX - 16;
+    tf.a1 = 64;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Range outside any user VMA -> ENOMEM. */
+    tf.a7 = SYS_MLOCK;
+    tf.a0 = 0;
+    tf.a1 = 16;
+    assert(syscall_dispatch(&tf, td) == -(i64) ENOMEM);
+
+    /* Valid range inside user space -> success. proc_map_user_page does
+     * not register a VMA, so the VMA portion of user_addr_valid is
+     * skipped (n_vmas == 0); the handler still exercises the bounds,
+     * non-empty, and non-wrap checks plus the page-table walk.
+     */
+    tf.a7 = SYS_MLOCK;
+    tf.a0 = (u64) va;
+    tf.a1 = 16;
+    assert(syscall_dispatch(&tf, td) == 0);
+    tf.a7 = SYS_MUNLOCK;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(mlock_munlock, selftest_mlock_munlock);
+
+/* fsync / fdatasync validate the FD is open and return success;
+ * Mazu has no separate sync path because SFS already commits
+ * synchronously and synthetic/ram filesystems have no backing store.
+ */
+static i32 selftest_fsync_fdatasync(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct trap_frame tf = {0};
+
+    /* Bad FD -> EBADF. */
+    tf.a7 = SYS_FSYNC;
+    tf.a0 = (u64) -1;
+    assert(syscall_dispatch(&tf, td) == -(i64) EBADF);
+    tf.a7 = SYS_FDATASYNC;
+    assert(syscall_dispatch(&tf, td) == -(i64) EBADF);
+
+    /* Out-of-range FD -> EBADF. */
+    tf.a7 = SYS_FSYNC;
+    tf.a0 = (u64) PROC_FD_MAX;
+    assert(syscall_dispatch(&tf, td) == -(i64) EBADF);
+
+    /* Closed but in-range FD -> EBADF. */
+    tf.a7 = SYS_FSYNC;
+    tf.a0 = PROC_FD_STDERR + 1;
+    assert(!p->fd_table[PROC_FD_STDERR + 1].is_open);
+    assert(syscall_dispatch(&tf, td) == -(i64) EBADF);
+
+    /* Open FD (stdout) -> success. */
+    tf.a7 = SYS_FSYNC;
+    tf.a0 = PROC_FD_STDOUT;
+    assert(syscall_dispatch(&tf, td) == 0);
+    tf.a7 = SYS_FDATASYNC;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    /* Pipe FD -> EINVAL (POSIX: fsync on a non-syncable file type). */
+    p->fd_table[PROC_FD_STDIN].is_pipe = true;
+    tf.a7 = SYS_FSYNC;
+    tf.a0 = PROC_FD_STDIN;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+    tf.a7 = SYS_FDATASYNC;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+    p->fd_table[PROC_FD_STDIN].is_pipe = false;
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(fsync_fdatasync, selftest_fsync_fdatasync);
+
+/* sigprocmask: SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK update the
+ * calling thread's blocked mask under sig_lock; SIGKILL cannot be
+ * blocked.
+ *
+ * Coverage limitation: with PROC_THREAD_MAX == 1 there is exactly one
+ * thread per proc, so this test cannot distinguish per-thread storage
+ * from per-process storage. A true test of state isolation between
+ * threads only becomes possible once SYS_THREAD_CREATE lands; at that
+ * point this test must be extended to spawn a second thread, mutate
+ * thread A's mask, and assert thread B's mask is unchanged.
+ */
+static i32 selftest_sigprocmask(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    /* Map a page for set / oldset. */
+    const vaddr_t va = USER_DATA_BASE + (132UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGPROCMASK;
+
+    /* Invalid how -> EINVAL. */
+    u32 set = 0xFFu;
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = 99;
+    tf.a1 = (u64) va;
+    tf.a2 = 0;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* SIG_SETMASK with all bits, including SIGKILL: SIGKILL gets
+     * masked off internally but the call still succeeds.
+     */
+    set = 0xFFFFFFFFu;
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = SIG_SETMASK;
+    tf.a1 = (u64) va;
+    tf.a2 = 0;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert((td->td_sig.blocked & sig_bit(SIGKILL)) == 0);
+    assert((td->td_sig.blocked & sig_bit(SIGTERM)) != 0);
+
+    /* SIG_UNBLOCK clears the bits. */
+    set = sig_bit(SIGTERM);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = SIG_UNBLOCK;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert((td->td_sig.blocked & sig_bit(SIGTERM)) == 0);
+
+    /* SIG_BLOCK ORs new bits onto existing ones. Start with one bit
+     * set, ask to block another, verify both are now set.
+     */
+    td->td_sig.blocked = sig_bit(SIGUSR1);
+    set = sig_bit(SIGTERM);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = SIG_BLOCK;
+    tf.a1 = (u64) va;
+    tf.a2 = 0;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert((td->td_sig.blocked & sig_bit(SIGUSR1)) != 0);
+    assert((td->td_sig.blocked & sig_bit(SIGTERM)) != 0);
+
+    /* Bad u_old pointer must NOT mutate the mask: pre-validation
+     * happens before lock acquisition. Save the mask, attempt with
+     * a bad oldset pointer, verify it failed with EFAULT and the
+     * mask is unchanged.
+     */
+    u32 saved = td->td_sig.blocked;
+    set = sig_bit(SIGCHLD);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = SIG_SETMASK;
+    tf.a1 = (u64) va;
+    tf.a2 = 0xDEADBEEFUL; /* bad user pointer */
+    assert(syscall_dispatch(&tf, td) == -(i64) EFAULT);
+    assert(td->td_sig.blocked == saved);
+
+    /* Read-only query (set == NULL) ignores how and returns the current
+     * mask via oldset, matching POSIX query-only semantics.
+     */
+    td->td_sig.blocked = sig_bit(SIGUSR1);
+    tf.a0 = 0;
+    tf.a1 = 0;
+    tf.a2 = (u64) va;
+    assert(syscall_dispatch(&tf, td) == 0);
+    u32 old = 0;
+    assert(copy_from_user(&old, va, sizeof(old)) == 0);
+    assert(old == sig_bit(SIGUSR1));
+    assert(td->td_sig.blocked == sig_bit(SIGUSR1));
+
+    /* Reset for cleanup. */
+    td->td_sig.blocked = 0;
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigprocmask, selftest_sigprocmask);
+
 static i32 selftest_sys_sched_setaffinity(void)
 {
     struct proc *p;
@@ -621,3 +996,404 @@ static i32 selftest_sys_sched_getaffinity_success(void)
 }
 DEFINE_SELFTEST(sys_sched_getaffinity_success,
                 selftest_sys_sched_getaffinity_success);
+
+/* Verify SYS_THREAD_GETSCHEDPARAM / SETSCHEDPARAM and SYS_SCHED_
+ * GETSCHEDULER / SETSCHEDULER on the calling thread. The mock task's
+ * td_base_prio is set explicitly so the privilege check (cannot raise
+ * above own base) does not reject the test value.
+ */
+static i32 selftest_thread_schedparam(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+    td->td_base_prio = (u8) (CONFIG_SCHED_NPRIO - 1);
+    /* The setschedparam path calls pi_mutex_refresh_prio which walks
+     * td->pi_held_mutexes; the mock task is zero-initialized, so
+     * initialize the list head to an empty (self-referential) state
+     * before the syscall runs.
+     */
+    list_init(&td->pi_held_mutexes);
+
+    struct trap_frame tf = {0};
+
+    /* Self getschedparam returns current base priority. */
+    tf.a7 = SYS_THREAD_GETSCHEDPARAM;
+    tf.a0 = 0;
+    assert(syscall_dispatch(&tf, td) == (i64) td->td_base_prio);
+
+    /* Self setschedparam to a lower priority (allowed). */
+    tf.a7 = SYS_THREAD_SETSCHEDPARAM;
+    tf.a0 = 0;
+    tf.a1 = SCHED_PRIO_IDLE;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(td->td_base_prio == SCHED_PRIO_IDLE);
+
+    /* Bogus priority -> EINVAL. */
+    tf.a1 = CONFIG_SCHED_NPRIO + 5;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Unknown TID -> ESRCH. */
+    tf.a7 = SYS_THREAD_GETSCHEDPARAM;
+    tf.a0 = (u64) U16_MAX;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+
+    /* sched_setscheduler / sched_getscheduler return SCHED_FIFO for
+     * the current process; SCHED_OTHER and SCHED_RR are accepted as
+     * input but coerced to the single supported policy.
+     */
+    tf.a7 = SYS_SCHED_GETSCHEDULER;
+    tf.a0 = 0;
+    assert(syscall_dispatch(&tf, td) == (i64) SCHED_FIFO);
+
+    tf.a7 = SYS_SCHED_SETSCHEDULER;
+    tf.a0 = 0;
+    tf.a1 = SCHED_OTHER;
+    tf.a2 = SCHED_PRIO_IDLE;
+    assert(syscall_dispatch(&tf, td) == (i64) SCHED_FIFO);
+
+    /* Bogus policy -> EINVAL. */
+    tf.a1 = 99;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(thread_schedparam, selftest_thread_schedparam);
+
+/* Verify SYS_THREAD_DETACH state transitions on a mock joinable
+ * thread. Cannot truly run a second thread inside a selftest task
+ * (we have no scheduler context for it here), but the lifecycle
+ * helper paths can be exercised through state observations.
+ */
+static i32 selftest_thread_detach_states(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    /* Allocate a second mock task to act as the detach target.  Mark
+     * it JOINABLE and attach via the reservation path.  The test
+     * mutates state directly because no real scheduler context is
+     * present for the secondary thread.
+     */
+    struct sched_task *target = alloc_mock_task();
+    assert(target);
+    target->id = td->id + 1;
+    target->td_join_state = TD_JOIN_JOINABLE;
+    init_waitqueue_head(&target->td_join_wq);
+    assert(attach_mock_thread(p, target));
+
+    /* Detach the JOINABLE target -> succeeds, state becomes DETACHED. */
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_THREAD_DETACH;
+    tf.a0 = target->id;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(target->td_join_state == TD_JOIN_DETACHED);
+
+    /* Second detach on a DETACHED thread -> EINVAL. */
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Join on a DETACHED thread -> EINVAL. */
+    tf.a7 = SYS_THREAD_JOIN;
+    tf.a0 = target->id;
+    tf.a1 = 0;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Self-join -> EDEADLK. */
+    tf.a0 = td->id;
+    assert(syscall_dispatch(&tf, td) == -(i64) EDEADLK);
+
+    /* Unknown TID -> ESRCH. */
+    tf.a0 = (u64) U16_MAX - 1;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+
+    /* Cleanup: detach the target before freeing the proc. */
+    u64 flags = proc_table_lock_irqsave();
+    proc_detach_task(p, target);
+    proc_table_unlock_irqrestore(flags);
+    free_mock_task(target);
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(thread_detach_states, selftest_thread_detach_states);
+
+static i32 selftest_thread_join_efault_preserves_exited_target(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct sched_task *target = alloc_mock_task();
+    assert(target);
+    target->proc = p;
+    target->id = td->id + 1;
+    target->td_join_state = TD_JOIN_EXITED;
+    target->td_exit_code = 42;
+    init_waitqueue_head(&target->td_join_wq);
+    assert(attach_mock_thread(p, target));
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_THREAD_JOIN;
+    tf.a0 = target->id;
+    tf.a1 = USER_CODE_BASE - sizeof(i32);
+    assert(syscall_dispatch(&tf, td) == -(i64) EFAULT);
+    assert(target->td_join_state == TD_JOIN_EXITED);
+    assert(proc_has_thread_tid(p, target->id));
+
+    const vaddr_t va = USER_DATA_BASE + (136UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+    tf.a1 = (u64) va;
+    assert(syscall_dispatch(&tf, td) == 0);
+    i32 exit_code = 0;
+    assert(copy_from_user(&exit_code, va, sizeof(exit_code)) == 0);
+    assert(exit_code == 42);
+    assert(!proc_has_thread_tid(p, target->id));
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(thread_join_efault_preserves_exited_target,
+                selftest_thread_join_efault_preserves_exited_target);
+
+/* Verify clock_gettime on the per-thread and per-process CPU-time
+ * clocks returns a valid timespec.  Mock task cpu_time_us is zero by
+ * default; the values are still validated for shape (no fault, no
+ * overflow into tv_nsec).
+ */
+static i32 selftest_clock_cputime(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (133UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_CLOCK_GETTIME;
+
+    td->cpu_time_us = 1234567ULL;
+
+    tf.a0 = CLOCK_THREAD_CPUTIME_ID;
+    tf.a1 = (u64) va;
+    assert(syscall_dispatch(&tf, td) == 0);
+    struct timespec out;
+    assert(copy_from_user(&out, va, sizeof(out)) == 0);
+    assert(out.tv_sec == 1);
+    assert(out.tv_nsec == 234567000);
+
+    tf.a0 = CLOCK_PROCESS_CPUTIME_ID;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(copy_from_user(&out, va, sizeof(out)) == 0);
+    /* Single-thread proc, so process CPU time equals thread CPU time. */
+    assert(out.tv_sec == 1);
+    assert(out.tv_nsec == 234567000);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(clock_cputime, selftest_clock_cputime);
+
+/* pthread_kill: thread-directed signal lands on td_sig.pending of
+ * the target, not on the per-proc proc_pending mask.
+ */
+static i32 selftest_pthread_kill(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct trap_frame tf = {0};
+
+    /* Self-target: signo lands on td->td_sig.pending. */
+    tf.a7 = SYS_PTHREAD_KILL;
+    tf.a0 = td->id;
+    tf.a1 = SIGUSR1;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert((td->td_sig.pending & sig_bit(SIGUSR1)) != 0);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) == 0);
+
+    /* Existence check (signo == 0) returns 0 without writing. */
+    td->td_sig.pending = 0;
+    tf.a1 = 0;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(td->td_sig.pending == 0);
+
+    /* SIGKILL on a single thread is rejected (it must be process-wide). */
+    tf.a1 = SIGKILL;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Unknown TID -> ESRCH. */
+    tf.a0 = (u64) U16_MAX - 5;
+    tf.a1 = SIGUSR1;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(pthread_kill, selftest_pthread_kill);
+
+static i32 selftest_pthread_kill_exited_thread_esrch(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct sched_task *target = alloc_mock_task();
+    assert(target);
+    target->proc = p;
+    target->id = td->id + 1;
+    target->td_join_state = TD_JOIN_EXITED;
+    init_waitqueue_head(&target->td_join_wq);
+    assert(attach_mock_thread(p, target));
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_PTHREAD_KILL;
+    tf.a0 = target->id;
+    tf.a1 = SIGUSR1;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+    assert(target->td_sig.pending == 0);
+
+    u64 flags = proc_table_lock_irqsave();
+    proc_detach_task(p, target);
+    proc_table_unlock_irqrestore(flags);
+    free_mock_task(target);
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(pthread_kill_exited_thread_esrch,
+                selftest_pthread_kill_exited_thread_esrch);
+
+/* pthread_setcancelstate: ENABLE / DISABLE flip td_cancel_disabled
+ * and report the prior state.
+ */
+static i32 selftest_thread_cancel_state(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (134UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_THREAD_SETCANCELSTATE;
+    tf.a0 = PTHREAD_CANCEL_DISABLE;
+    tf.a1 = (u64) va;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(td->td_cancel_disabled == true);
+    i32 old;
+    assert(copy_from_user(&old, va, sizeof(old)) == 0);
+    assert(old == PTHREAD_CANCEL_ENABLE);
+
+    tf.a0 = PTHREAD_CANCEL_ENABLE;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(td->td_cancel_disabled == false);
+    assert(copy_from_user(&old, va, sizeof(old)) == 0);
+    assert(old == PTHREAD_CANCEL_DISABLE);
+
+    /* Bogus state -> EINVAL. */
+    tf.a0 = 99;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* SYS_THREAD_CANCEL on unknown TID -> ESRCH. */
+    tf.a7 = SYS_THREAD_CANCEL;
+    tf.a0 = (u64) U16_MAX - 7;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+
+    /* SYS_THREAD_CANCEL on self-tid sets td_cancel_pending. */
+    tf.a0 = td->id;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(td->td_cancel_pending == true);
+
+    /* testcancel with cancellation disabled returns 0 without
+     * exiting the thread.
+     */
+    td->td_cancel_disabled = true;
+    tf.a7 = SYS_THREAD_TESTCANCEL;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(thread_cancel_state, selftest_thread_cancel_state);
+
+static i32 selftest_thread_cancel_exited_thread_esrch(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct sched_task *target = alloc_mock_task();
+    assert(target);
+    target->proc = p;
+    target->id = td->id + 1;
+    target->td_join_state = TD_JOIN_EXITED;
+    init_waitqueue_head(&target->td_join_wq);
+    assert(attach_mock_thread(p, target));
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_THREAD_CANCEL;
+    tf.a0 = target->id;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+    assert(target->td_cancel_pending == false);
+
+    u64 flags = proc_table_lock_irqsave();
+    proc_detach_task(p, target);
+    proc_table_unlock_irqrestore(flags);
+    free_mock_task(target);
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(thread_cancel_exited_thread_esrch,
+                selftest_thread_cancel_exited_thread_esrch);
+
+/* sigtimedwait: zero set -> EINVAL; immediate timeout if no signals
+ * pending; immediate dequeue if signal already pending.
+ */
+static i32 selftest_sigtimedwait(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (135UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGTIMEDWAIT;
+
+    /* Empty set -> EINVAL. */
+    u32 set = 0;
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = (u64) va;
+    tf.a1 = 0;
+    tf.a2 = 0;
+    assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
+
+    /* Pre-pend a signal in the per-thread mask, then sigtimedwait
+     * should dequeue it immediately and return its number.
+     */
+    td->td_sig.pending = sig_bit(SIGUSR1) | sig_bit(SIGUSR2);
+    set = sig_bit(SIGUSR2);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a0 = (u64) va;
+    tf.a1 = (u64) (va + sizeof(u32));
+    tf.a2 = 0;
+    i64 ret = syscall_dispatch(&tf, td);
+    assert(ret == SIGUSR2);
+    assert((td->td_sig.pending & sig_bit(SIGUSR2)) == 0);
+    assert((td->td_sig.pending & sig_bit(SIGUSR1)) != 0);
+    i32 sout;
+    assert(copy_from_user(&sout, va + sizeof(u32), sizeof(sout)) == 0);
+    assert(sout == SIGUSR2);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigtimedwait, selftest_sigtimedwait);

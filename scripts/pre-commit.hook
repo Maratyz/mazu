@@ -85,8 +85,12 @@ if [ ${#ch_files[@]} -gt 0 ]; then
     if command -v "$CLANG_FMT" >/dev/null 2>&1; then
         fmt_failures=()
         for f in "${ch_files[@]}"; do
-            if ! git show ":$f" | "$CLANG_FMT" --style=file --dry-run --Werror \
-                2>/dev/null; then
+            # --assume-filename preserves include-sort context: without it,
+            # clang-format reading from stdin treats the main-include header
+            # as a regular include and reorders it alphabetically, which is
+            # a false positive vs the on-disk format.
+            if ! git show ":$f" | "$CLANG_FMT" --style=file \
+                --assume-filename="$f" --dry-run --Werror 2>/dev/null; then
                 fmt_failures+=("$f")
             fi
         done

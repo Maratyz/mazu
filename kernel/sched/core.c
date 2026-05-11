@@ -16,7 +16,9 @@
 #include <mazu/uaccess.h>
 #include "../kres.h"
 #include "../lockdep.h"
+#include "../proc/signal.h"
 #include "../sync/mutex.h"
+#include "waitqueue.h"
 
 /* Lock ordering (global):
  *   wq->lock  ->  pcpu_runq_lock[cpu]  (never reversed)
@@ -545,21 +547,86 @@ static inline void sched_stage_deferred_free(struct sched_task *task, u32 cpuid)
     sched_deferred_free[cpuid] = task;
 }
 
-/* Free a dead task's stack and callouts.  Synchronization resources (PI
- * mutexes, block cleanup, kres) were already released immediately in
- * sched_schedule() to avoid latency under NO_HZ.
+/* Cancel callouts and tear down DL state. Safe to call multiple times
+ * because callout_cancel_sync is idempotent and sched_dl_task_destroy
+ * removes the DL entity if present. Separated from the final
+ * kvalloc_free so a joinable user thread can be cancelled at exit
+ * but reaped later by SYS_THREAD_JOIN.
  */
-static void sched_destroy_dead_task(struct sched_task *dead)
+static void sched_task_cancel_runtime(struct sched_task *dead)
 {
-    assert(dead);
     callout_cancel_sync(&dead->td_sleep_callout);
     callout_cancel_sync(&dead->td_quantum_callout);
 #if CONFIG_SCHED_DEADLINE
     sched_dl_task_destroy(dead);
 #endif
+}
+
+/* Final teardown: poison magic, restore the guard page, free the task
+ * struct. Caller must guarantee no other reader holds a reference.
+ */
+static void sched_task_finalize_free(struct sched_task *dead)
+{
     dead->magic = 0xDEADDEADU;
     paging_map_page((vaddr_t) dead->guard, (paddr_t) dead->guard, PT_FLAG_RW);
     kvalloc_free(byte_array_new((void *) dead, sizeof(*dead)));
+}
+
+/* Free a dead task's stack and callouts. Synchronization resources
+ * (PI mutexes, block cleanup, kres) were already released
+ * immediately in sched_schedule() to avoid latency under NO_HZ.
+ *
+ * For user threads, this is the sole place the JOIN_JOINABLE ->
+ * JOIN_EXITED transition happens. Running here (on the cleanup
+ * hart, after the dying thread has fully descheduled) guarantees
+ * any joiner observing EXITED is safe to reap: no remaining hart
+ * is executing the task body. Joinable threads skip the final
+ * kvalloc_free; the joiner finishes that step via
+ * sched_reap_user_thread once it claims the REAPED transition.
+ */
+static void sched_destroy_dead_task(struct sched_task *dead)
+{
+    assert(dead);
+    sched_task_cancel_runtime(dead);
+    if (dead->proc && dead->td_join_state == TD_JOIN_JOINABLE) {
+        /* Atomic flip JOINABLE -> EXITED so a concurrent
+         * sys_thread_detach observing JOINABLE cannot also try to
+         * mark EXITED. After the flip, wake any pending joiners.
+         */
+        u8 prev = (u8) TD_JOIN_JOINABLE;
+        u8 next = (u8) TD_JOIN_EXITED;
+        if (__atomic_compare_exchange_n((u8 *) &dead->td_join_state, &prev,
+                                        next, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED)) {
+            wake_up(&dead->td_join_wq, I32_MAX);
+            wake_up(&dead->proc->thread_event_wq, I32_MAX);
+            return; /* leave the struct allocated for the joiner */
+        }
+        /* Lost the race to detach: state is now DETACHED, fall
+         * through to free.
+         */
+    }
+    if (dead->proc && dead->td_join_state == TD_JOIN_DETACHED)
+        proc_reap_exited_thread(dead->proc, dead);
+    sched_task_finalize_free(dead);
+}
+
+/* Reap a user thread that exited in JOINABLE state. The caller (the
+ * SYS_THREAD_JOIN handler or proc_exit) must have already won the
+ * transition from TD_JOIN_EXITED to TD_JOIN_REAPED via
+ * __atomic_compare_exchange_n so only one reaper runs the final
+ * kvalloc_free.
+ */
+void sched_reap_user_thread(struct sched_task *dead)
+{
+    if (!dead)
+        return;
+    /* Cancellation already ran in sched_destroy_dead_task. Calling
+     * again is idempotent (callout_cancel_sync handles already-
+     * cancelled callouts).
+     */
+    sched_task_cancel_runtime(dead);
+    sched_task_finalize_free(dead);
 }
 
 void sched_set_block_cleanup(struct sched_task *task,
@@ -1057,6 +1124,15 @@ static struct sched_task *sched_task_alloc_init(void)
     callout_init(&task->td_sleep_callout);
     callout_init(&task->td_quantum_callout);
 
+    /* Thread lifecycle defaults: kernel tasks bypass the join machinery
+     * entirely (TD_JOIN_FREE). User-thread creation sets JOINABLE
+     * before enqueuing.
+     */
+    task->td_join_state = TD_JOIN_FREE;
+    task->td_exit_code = 0;
+    init_waitqueue_head(&task->td_join_wq);
+    task->td_exit_started = false;
+
 #if CONFIG_SCHED_DEADLINE
     sched_dl_task_init(task);
 #endif
@@ -1155,14 +1231,34 @@ struct result sched_create_task_noreturn(sched_callback_func_t callback,
                                            SCHED_PRIO_NORMAL);
 }
 
+/* Per-thread user stack VA within the proc slot.  Thread index 0
+ * (the leader) gets the top of the slot; thread N's stack occupies
+ * the band immediately below thread N-1's guard page.  Each band is
+ * USER_STACK_SIZE + PAGE_SIZE (one stack + one guard).
+ */
+static vaddr_t user_thread_stack_top(struct proc *p, u8 idx)
+{
+    return (vaddr_t) (p->va_stack_top -
+                      (u64) idx * (USER_STACK_SIZE + PAGE_SIZE));
+}
+
+static void rollback_user_thread_stack(struct proc *p,
+                                       ptr stack_bottom,
+                                       vaddr_t stack_top_va)
+{
+    for (ptr va = stack_bottom; va < (ptr) stack_top_va; va += PAGE_SIZE)
+        proc_unmap_user_page(p, (vaddr_t) va);
+    proc_remove_vma(p, (vaddr_t) stack_bottom, USER_STACK_SIZE);
+}
+
 struct result sched_create_user_task(struct proc *p, ptr entry, u8 prio)
 {
     assert(global_sched_initialized);
     assert(p);
     assert(prio < CONFIG_SCHED_NPRIO);
 
-    /* Use per-process VA window for stack placement. */
-    vaddr_t stack_top_va = p->va_stack_top;
+    /* Leader stack at the top of the per-process VA window. */
+    vaddr_t stack_top_va = user_thread_stack_top(p, 0);
     ptr stack_bottom = (ptr) (stack_top_va - USER_STACK_SIZE);
     for (ptr va = stack_bottom; va < (ptr) stack_top_va; va += PAGE_SIZE) {
         struct result r = proc_map_user_page(p, va, PT_FLAG_USER | PT_FLAG_RW);
@@ -1190,6 +1286,11 @@ struct result sched_create_user_task(struct proc *p, ptr entry, u8 prio)
         return result_error(ENOMEM);
 
     task->proc = p;
+    /* The leader is the first thread of the process; mark joinable so
+     * pthread_join on the leader's TID has well-defined semantics.
+     * Process exit triggers TD_JOIN_REAPED handling separately.
+     */
+    task->td_join_state = TD_JOIN_JOINABLE;
 
     /* Build trapframe for U-mode entry.
      * SPP = 0 (return to U-mode), SPIE = 1 (enable interrupts on sret).
@@ -1199,13 +1300,142 @@ struct result sched_create_user_task(struct proc *p, ptr entry, u8 prio)
     task->td_tf.sstatus = SSTATUS_SPIE; /* SPP=0 for U-mode */
 
     /* Set proc<->task link before enqueue - once enqueued, another hart
-     * may schedule the task immediately.
+     * may schedule the task immediately. The first task in the proc
+     * becomes the thread-group leader; subsequent tasks (when
+     * pthread_create lands) attach into higher slots.
+     *
+     * On attach failure (task table full) the freshly allocated task
+     * must be torn down: the guard page was unmapped during alloc, so
+     * remap it before kvalloc_free or the next allocation observing the
+     * same physical page would page-fault on first touch.
      */
-    p->task = task;
+    {
+        u64 pflags = proc_table_lock_irqsave();
+        bool ok = proc_attach_task(p, task);
+        proc_table_unlock_irqrestore(pflags);
+        if (!ok) {
+            task->proc = NULL;
+            paging_map_page((vaddr_t) task->guard, (paddr_t) task->guard,
+                            PT_FLAG_RW);
+            kvalloc_free(byte_array_new((void *) task, sizeof(*task)));
+            return result_error(EAGAIN);
+        }
+    }
 
     sched_task_enqueue(task, prio);
 
     return result_ok();
+}
+
+/* Create an additional user thread inside an existing process. The
+ * process must already have at least one task (the leader).  The new
+ * thread runs at u_entry with u_arg in a0, on its own stack assigned
+ * out of the per-process VA window.  Caller must NOT hold
+ * proc_table_lock; this routine takes it internally. On any failure
+ * path the proc state is unchanged.
+ */
+i32 sched_create_user_thread(struct proc *p,
+                             ptr u_entry,
+                             ptr u_arg,
+                             u8 prio,
+                             u32 inherited_sigmask,
+                             struct sched_task **out_td)
+{
+    assert(global_sched_initialized);
+    if (!p || !out_td)
+        return -(i32) EINVAL;
+    if (prio >= CONFIG_SCHED_NPRIO)
+        return -(i32) EINVAL;
+
+    u8 slot = PROC_THREAD_MAX;
+    i32 reserve_rc = -(i32) EAGAIN;
+    {
+        u64 pflags = proc_table_lock_irqsave();
+        if (proc_reserve_thread_slot(p, &slot)) {
+            reserve_rc = 0;
+        } else if (p->state != PROC_STATE_RUNNING || p->n_tasks == 0) {
+            reserve_rc = -(i32) ESRCH;
+        }
+        proc_table_unlock_irqrestore(pflags);
+    }
+    if (slot == PROC_THREAD_MAX)
+        return reserve_rc;
+
+    vaddr_t stack_top_va = user_thread_stack_top(p, slot);
+    ptr stack_bottom = (ptr) (stack_top_va - USER_STACK_SIZE);
+    for (ptr va = stack_bottom; va < (ptr) stack_top_va; va += PAGE_SIZE) {
+        struct result r = proc_map_user_page(p, va, PT_FLAG_USER | PT_FLAG_RW);
+        if (r.is_error) {
+            rollback_user_thread_stack(p, stack_bottom, stack_top_va);
+            u64 pflags = proc_table_lock_irqsave();
+            proc_release_thread_slot(p, slot);
+            proc_table_unlock_irqrestore(pflags);
+            return -(i32) r.code;
+        }
+    }
+    vaddr_t guard_va = (vaddr_t) stack_bottom - PAGE_SIZE;
+    if ((uptr) guard_va >= (uptr) p->va_code_base)
+        paging_unmap_page(guard_va);
+
+    i32 vma_rc = proc_add_vma(p, stack_bottom, USER_STACK_SIZE,
+                              VMA_PERM_READ | VMA_PERM_WRITE);
+    if (vma_rc < 0) {
+        rollback_user_thread_stack(p, stack_bottom, stack_top_va);
+        u64 pflags = proc_table_lock_irqsave();
+        proc_release_thread_slot(p, slot);
+        proc_table_unlock_irqrestore(pflags);
+        return -(i32) ENOMEM;
+    }
+
+    struct sched_task *task = sched_task_alloc_init();
+    if (!task) {
+        rollback_user_thread_stack(p, stack_bottom, stack_top_va);
+        u64 pflags = proc_table_lock_irqsave();
+        proc_release_thread_slot(p, slot);
+        proc_table_unlock_irqrestore(pflags);
+        return -(i32) ENOMEM;
+    }
+
+    task->proc = p;
+    task->td_tf.sepc = (u64) u_entry;
+    task->td_tf.sp = (u64) stack_top_va;
+    task->td_tf.a0 = (u64) u_arg;
+    /* Implicit return: when the thread function returns, ra points at
+     * an unmapped per-process trampoline; the resulting page fault is
+     * handled in trap_dispatch by issuing SYS_THREAD_EXIT(0). Without
+     * this, returning from the entry function would pop a zeroed ra
+     * and fault to a different address that kills the whole process.
+     */
+    task->td_tf.ra = (u64) thread_exit_trampoline_pc(p);
+    /* s11 (callee-saved) carries the trampoline magic so trap.c can
+     * distinguish a clean implicit return from a wild-pointer jump
+     * that happens to land on the trampoline PC.
+     */
+    task->td_tf.s11 = THREAD_EXIT_TRAMPOLINE_MAGIC;
+    task->td_tf.sstatus = SSTATUS_SPIE;
+    task->td_join_state = TD_JOIN_JOINABLE;
+    task->td_sig.blocked = inherited_sigmask;
+
+    {
+        u64 pflags = proc_table_lock_irqsave();
+        bool ok = p->state == PROC_STATE_RUNNING &&
+                  proc_attach_task_slot(p, task, slot);
+        if (!ok)
+            proc_release_thread_slot(p, slot);
+        proc_table_unlock_irqrestore(pflags);
+        if (!ok) {
+            task->proc = NULL;
+            paging_map_page((vaddr_t) task->guard, (paddr_t) task->guard,
+                            PT_FLAG_RW);
+            kvalloc_free(byte_array_new((void *) task, sizeof(*task)));
+            rollback_user_thread_stack(p, stack_bottom, stack_top_va);
+            return -(i32) EAGAIN;
+        }
+    }
+
+    sched_task_enqueue(task, prio);
+    *out_td = task;
+    return 0;
 }
 
 u16 sched_current_id(void)
@@ -1276,6 +1506,31 @@ void sched_wake_sleeping(struct sched_task *td)
      */
     callout_cancel_sync(&td->td_sleep_callout);
     sched_enqueue_ready(td);
+}
+
+void sched_cancel_blocked(struct sched_task *task)
+{
+    if (!task)
+        return;
+
+    if (task->state == TD_STATE_SLEEPING) {
+        sched_wake_sleeping(task);
+        return;
+    }
+
+    if (task->state != TD_STATE_BLOCKED && task->state != TD_STATE_SEM_WAIT)
+        return;
+
+    if (task->td_block_cleanup) {
+        sched_block_cleanup_fn_t fn = task->td_block_cleanup;
+        void *ctx = task->td_block_cleanup_ctx;
+
+        sched_clear_block_cleanup(task);
+        fn(task, ctx);
+    }
+
+    if (task->state == TD_STATE_BLOCKED || task->state == TD_STATE_SEM_WAIT)
+        sched_wake_ready(task);
 }
 
 void sleep_ms(struct time_ms duration)

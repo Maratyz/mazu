@@ -45,8 +45,11 @@ i32 condvar_wait(struct condvar *cv, struct pi_mutex *mtx)
 
     finish_wait(&cv->wq, &wqe);
     pi_mutex_lock(mtx);
-    if (wqe.reason == WAIT_UNBLOCK_DESTROY && signal_pending_current())
-        return -(i32) EINTR;
+    if (wqe.reason == WAIT_UNBLOCK_DESTROY) {
+        i32 abort = wait_abort_error_current();
+        if (abort < 0)
+            return abort;
+    }
     return 0;
 }
 
@@ -118,12 +121,13 @@ i32 condvar_wait_timeout(struct condvar *cv,
     finish_wait(&cv->wq, &wqe);
 
     bool timed_out = (wqe.reason == WAIT_UNBLOCK_TIMEOUT);
-    bool interrupted =
-        (wqe.reason == WAIT_UNBLOCK_DESTROY && signal_pending_current());
+    i32 abort = 0;
+    if (wqe.reason == WAIT_UNBLOCK_DESTROY)
+        abort = wait_abort_error_current();
 
     pi_mutex_lock(mtx);
-    if (interrupted)
-        return -(i32) EINTR;
+    if (abort < 0)
+        return abort;
     return timed_out ? -(i32) ETIMEDOUT : 0;
 }
 

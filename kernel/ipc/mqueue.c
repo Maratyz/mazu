@@ -224,10 +224,11 @@ i32 mqueue_send(i32 handle, const void *msg, sz len, u32 priority)
             lockdep_release(LOCK_LEVEL_WAITQ);
             return -(i32) EBADF;
         }
-        if (signal_pending_current()) {
+        i32 abort = wait_abort_error_current();
+        if (abort < 0) {
             spin_unlock_irqrestore(&mq->lock, flags);
             lockdep_release(LOCK_LEVEL_WAITQ);
-            return -(i32) EINTR;
+            return abort;
         }
         struct mq_waiter w = {
             .task = sched_current_task(),
@@ -331,10 +332,11 @@ i32 mqueue_receive(i32 handle, void *buf, sz buf_size, u32 *out_priority)
             lockdep_release(LOCK_LEVEL_WAITQ);
             return -(i32) EBADF;
         }
-        if (signal_pending_current()) {
+        i32 abort = wait_abort_error_current();
+        if (abort < 0) {
             spin_unlock_irqrestore(&mq->lock, flags);
             lockdep_release(LOCK_LEVEL_WAITQ);
-            return -(i32) EINTR;
+            return abort;
         }
         struct mq_waiter w = {
             .task = sched_current_task(),
@@ -441,12 +443,11 @@ i32 mqueue_timedreceive(i32 handle,
     sched_set_task_state(w.task, TD_STATE_BLOCKED);
     sched_set_block_cleanup(w.task, mq_wait_cleanup, &cleanup);
 
-    bool interrupted = false;
+    i32 abort = 0;
     while (!w.woken && !tctx.timed_out) {
-        if (signal_pending_current()) {
-            interrupted = true;
+        abort = wait_abort_error_current();
+        if (abort < 0)
             break;
-        }
         spin_unlock_irqrestore(&mq->lock, flags);
         lockdep_release(LOCK_LEVEL_WAITQ);
         sched_yield_trap();
@@ -460,8 +461,8 @@ i32 mqueue_timedreceive(i32 handle,
         sched_set_task_state(w.task, TD_STATE_RUNNING);
 
     i32 ret;
-    if (interrupted) {
-        ret = -(i32) EINTR;
+    if (abort < 0) {
+        ret = abort;
     } else if (!mq->in_use || mq->generation != generation) {
         ret = -(i32) EBADF;
     } else if (w.woken && !list_empty(&mq->msgs)) {

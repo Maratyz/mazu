@@ -163,14 +163,15 @@ i32 sem_wait_interruptible(struct semaphore *sem)
     sched_set_task_state(w.task, TD_STATE_SEM_WAIT);
     sched_set_block_cleanup(w.task, sem_wait_cleanup, &cleanup);
     while (!w.granted) {
-        if (signal_pending_current()) {
+        i32 abort = wait_abort_error_current();
+        if (abort < 0) {
             list_del_init(&w.node);
             sched_clear_block_cleanup(w.task);
             if (w.task->state == TD_STATE_SEM_WAIT)
                 sched_set_task_state(w.task, TD_STATE_RUNNING);
             spin_unlock_irqrestore(&sem->lock, flags);
             lockdep_release(LOCK_LEVEL_WAITQ);
-            return -(i32) EINTR;
+            return abort;
         }
         spin_unlock_irqrestore(&sem->lock, flags);
         lockdep_release(LOCK_LEVEL_WAITQ);
@@ -298,12 +299,11 @@ i32 sem_timedwait(struct semaphore *sem, struct time_ms timeout)
     sched_set_task_state(w.task, TD_STATE_SEM_WAIT);
     sched_set_block_cleanup(w.task, sem_wait_cleanup, &cleanup);
 
-    bool interrupted = false;
+    i32 abort = 0;
     while (!w.granted && !tctx.timed_out) {
-        if (signal_pending_current()) {
-            interrupted = true;
+        abort = wait_abort_error_current();
+        if (abort < 0)
             break;
-        }
         spin_unlock_irqrestore(&sem->lock, flags);
         lockdep_release(LOCK_LEVEL_WAITQ);
 
@@ -331,7 +331,7 @@ i32 sem_timedwait(struct semaphore *sem, struct time_ms timeout)
 
     if (got_token)
         return 0;
-    return interrupted ? -(i32) EINTR : -(i32) ETIMEDOUT;
+    return (abort < 0) ? abort : -(i32) ETIMEDOUT;
 }
 
 #include __INC_TEST(semaphore)

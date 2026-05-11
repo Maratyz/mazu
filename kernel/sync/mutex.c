@@ -115,7 +115,8 @@ i32 pi_mutex_lock_interruptible(struct pi_mutex *mtx)
         lockdep_acquire(LOCK_LEVEL_WAITQ);
         u64 flags = spin_lock_irqsave(&mtx->lock);
 
-        if (signal_pending_current() && w.node.next != &w.node && !w.granted) {
+        i32 abort = wait_abort_error_current();
+        if (abort < 0 && w.node.next != &w.node && !w.granted) {
             list_del_init(&w.node);
             if (list_empty(&mtx->waiters))
                 mtx->top_waiter_prio = 0;
@@ -131,7 +132,7 @@ i32 pi_mutex_lock_interruptible(struct pi_mutex *mtx)
                 sched_set_task_state(self, TD_STATE_RUNNING);
             spin_unlock_irqrestore(&mtx->lock, flags);
             lockdep_release(LOCK_LEVEL_WAITQ);
-            return -(i32) EINTR;
+            return abort;
         }
 
         /* Direct handover: unlock (or release_all) transferred ownership.

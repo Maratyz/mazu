@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include <mazu/proc.h>
+#include <mazu/sched.h>
 #include <mazu/selftest.h>
 
 static i32 selftest_proc_alloc_free(void)
@@ -380,3 +381,114 @@ static i32 selftest_proc_count_children(void)
     return 0;
 }
 DEFINE_SELFTEST(proc_count_children, selftest_proc_count_children);
+
+/* Verify the bounded per-process task list: a fresh proc has zero tasks
+ * and no leader, attach + detach round-trip preserves invariants, the
+ * list rejects overflow, and the leader accessor matches.  Today
+ * PROC_THREAD_MAX is 1; the test still exercises the second-attach path
+ * to lock the bound in for future-proofing.
+ *
+ * The dummies are heap-allocated rather than stack-allocated because
+ * struct sched_task carries an embedded kernel stack and guard page;
+ * two of them on the test task's stack would overflow it.
+ */
+static i32 selftest_proc_task_list(void)
+{
+    struct proc *p = proc_alloc();
+    assert(p != NULL);
+    assert(p->n_tasks == 0);
+    assert(proc_thread_group_leader(p) == NULL);
+    /* Transition to RUNNING so proc_reserve_thread_slot accepts the
+     * proc; that helper rejects EMBRYO / ZOMBIE / FREE intentionally
+     * to prevent reservations against half-constructed or exiting
+     * processes.
+     */
+    proc_set_state(p, PROC_STATE_RUNNING);
+
+    struct option_byte_array a_mem =
+        kvalloc_alloc(sizeof(struct sched_task), alignof(struct sched_task));
+    struct option_byte_array b_mem =
+        kvalloc_alloc(sizeof(struct sched_task), alignof(struct sched_task));
+    assert(!a_mem.is_none);
+    assert(!b_mem.is_none);
+    struct byte_array a_ba = option_byte_array_checked(a_mem);
+    struct byte_array b_ba = option_byte_array_checked(b_mem);
+    struct sched_task *dummy_a = byte_array_ptr(a_ba);
+    struct sched_task *dummy_b = byte_array_ptr(b_ba);
+    memset(dummy_a, 0, sizeof(*dummy_a));
+    memset(dummy_b, 0, sizeof(*dummy_b));
+
+    /* First attach (n_tasks == 0) bypasses the reservation requirement;
+     * proc_attach_task picks slot 0 and elects the leader.
+     */
+    u64 flags = proc_table_lock_irqsave();
+    bool ok = proc_attach_task(p, dummy_a);
+    proc_table_unlock_irqrestore(flags);
+    assert(ok);
+    assert(p->n_tasks == 1);
+    assert(proc_thread_group_leader(p) == dummy_a);
+
+    /* Subsequent attaches (n_tasks > 0) require a slot reservation
+     * first. proc_reserve_thread_slot picks the lowest free slot under
+     * lock; proc_attach_task_slot consumes that reservation.
+     */
+    u8 slot = PROC_THREAD_MAX;
+    flags = proc_table_lock_irqsave();
+    ok = proc_reserve_thread_slot(p, &slot);
+    proc_table_unlock_irqrestore(flags);
+    assert(ok);
+    assert(slot < PROC_THREAD_MAX);
+
+    flags = proc_table_lock_irqsave();
+    ok = proc_attach_task_slot(p, dummy_b, slot);
+    proc_table_unlock_irqrestore(flags);
+    assert(ok);
+    assert(p->n_tasks == 2);
+    assert(proc_thread_group_leader(p) == dummy_a);
+
+    /* Detach the leader; dummy_b is still attached. proc_thread_group_
+     * leader migrates to the next live slot.
+     */
+    dummy_a->proc = p;
+    flags = proc_table_lock_irqsave();
+    proc_detach_task(p, dummy_a);
+    proc_table_unlock_irqrestore(flags);
+    assert(p->n_tasks == 1);
+    assert(dummy_a->proc == NULL);
+
+    flags = proc_table_lock_irqsave();
+    proc_detach_task(p, dummy_b);
+    proc_table_unlock_irqrestore(flags);
+    assert(p->n_tasks == 0);
+    assert(proc_thread_group_leader(p) == NULL);
+
+    /* Detaching a task that is not in the list is a no-op. */
+    flags = proc_table_lock_irqsave();
+    proc_detach_task(p, dummy_b);
+    proc_table_unlock_irqrestore(flags);
+    assert(p->n_tasks == 0);
+
+    /* Re-attach after detach: the slot must be reusable.  Verifies the
+     * detach path leaves leader_idx in a state where the next attach
+     * picks the freed slot back up.
+     */
+    flags = proc_table_lock_irqsave();
+    ok = proc_attach_task(p, dummy_b);
+    proc_table_unlock_irqrestore(flags);
+    assert(ok);
+    assert(p->n_tasks == 1);
+    assert(proc_thread_group_leader(p) == dummy_b);
+
+    flags = proc_table_lock_irqsave();
+    proc_detach_task(p, dummy_b);
+    proc_table_unlock_irqrestore(flags);
+    assert(p->n_tasks == 0);
+    assert(proc_thread_group_leader(p) == NULL);
+
+    kvalloc_free(a_ba);
+    kvalloc_free(b_ba);
+    proc_set_state(p, PROC_STATE_ZOMBIE);
+    proc_free(p);
+    return 0;
+}
+DEFINE_SELFTEST(proc_task_list, selftest_proc_task_list);

@@ -30,6 +30,7 @@
 #include <mazu/vfs.h>
 
 #include "../ipc/mqueue.h"
+#include "../sched/waitqueue.h"
 #include "../sync/futex.h"
 #include "../sync/mutex.h"
 #include "../sync/sync_handle.h"
@@ -43,6 +44,11 @@
  * silently writes past the end during dispatch.
  */
 static_assert(SYS_NR <= 128, "syscall_allow[2] only covers nrs 0..127");
+
+static i64 cancel_thread_now(struct trap_frame *tf, struct sched_task *td);
+static i64 maybe_cancel_at_cancellation_point(struct trap_frame *tf,
+                                              struct sched_task *td,
+                                              i64 rc);
 
 /* Copy a user-space path into kpath[257].  Returns the kernel str on success,
  * or sets *err to a negative errno and returns an empty str.
@@ -875,7 +881,8 @@ static i64 sys_futex(struct trap_frame *tf, struct sched_task *td)
 
     switch (op) {
     case FUTEX_WAIT:
-        return futex_wait(uaddr, val);
+        return maybe_cancel_at_cancellation_point(tf, td,
+                                                  futex_wait(uaddr, val));
     case FUTEX_WAKE:
         return futex_wake(uaddr, val);
     case FUTEX_CMP_REQUEUE: {
@@ -886,7 +893,7 @@ static i64 sys_futex(struct trap_frame *tf, struct sched_task *td)
         return futex_cmp_requeue(uaddr, val, uaddr2, 1, nr_requeue);
     }
     case FUTEX_LOCK_PI:
-        return futex_lock_pi(uaddr);
+        return maybe_cancel_at_cancellation_point(tf, td, futex_lock_pi(uaddr));
     case FUTEX_UNLOCK_PI:
         return futex_unlock_pi(uaddr);
     default:
@@ -986,6 +993,36 @@ i64 sys_sysconf_query(i64 name)
         return (i64) (PROC_MAX - 1); /* minus one for the parent */
     case _SC_MEMLOCK:
         return 0; /* all memory is resident; locking is implicit */
+    /* PSE51 option reporting: present features return their _POSIX_*
+     * value, absent features return -1.  See docs/pse51-matrix.md.
+     */
+    case _SC_TIMERS:
+        return (i64) _POSIX_TIMERS;
+    case _SC_MONOTONIC_CLOCK:
+        return (i64) _POSIX_MONOTONIC_CLOCK;
+    case _SC_PRIORITY_SCHEDULING:
+        return (i64) _POSIX_PRIORITY_SCHEDULING;
+    case _SC_SEMAPHORES:
+        return (i64) _POSIX_SEMAPHORES;
+    case _SC_BARRIERS:
+        return (i64) _POSIX_BARRIERS;
+    case _SC_READER_WRITER_LOCKS:
+        return (i64) _POSIX_READER_WRITER_LOCKS;
+    case _SC_THREAD_PRIORITY_INHERIT:
+        return (i64) _POSIX_THREAD_PRIO_INHERIT;
+    case _SC_MESSAGE_PASSING:
+        return (i64) _POSIX_MESSAGE_PASSING;
+    case _SC_THREADS:
+        return (i64) _POSIX_THREADS;
+    case _SC_THREAD_CPUTIME:
+        return (i64) _POSIX_THREAD_CPUTIME;
+    case _SC_CPUTIME:
+        return (i64) _POSIX_CPUTIME;
+    case _SC_REALTIME_SIGNALS:
+        return (i64) _POSIX_REALTIME_SIGNALS;
+    case _SC_SPIN_LOCKS: /* fall through; userspace surface absent */
+    case _SC_CLOCK_SELECTION:
+        return -1; /* feature not implemented (POSIX-style negative reply) */
     default:
         return -(i64) EINVAL;
     }
@@ -1033,15 +1070,18 @@ static i64 sys_sched_setaffinity(struct trap_frame *tf, struct sched_task *td)
         __atomic_store_n(&target->td_affinity, affinity, __ATOMIC_RELEASE);
     } else {
         /* Hold proc_table_lock across find + affinity write to prevent
-         * proc_exit() from detaching and freeing p->task concurrently.
+         * proc_exit() from detaching the leader concurrently. Once
+         * pthread_create lands, "set affinity by PID" still targets the
+         * thread-group leader (POSIX sched_setaffinity semantics).
          */
         u64 pflags = proc_table_lock_irqsave();
         struct proc *p = proc_find_locked(pid);
-        if (!p || !p->task) {
+        struct sched_task *leader = proc_thread_group_leader(p);
+        if (!leader) {
             proc_table_unlock_irqrestore(pflags);
             return -(i64) ESRCH;
         }
-        target = p->task;
+        target = leader;
         __atomic_store_n(&target->td_affinity, affinity, __ATOMIC_RELEASE);
 #if CONFIG_SMP
         u32 last_cpu = target->td_last_cpu;
@@ -1093,11 +1133,12 @@ static i64 sys_sched_getaffinity(struct trap_frame *tf, struct sched_task *td)
     } else {
         u64 pflags = proc_table_lock_irqsave();
         struct proc *p = proc_find_locked(pid);
-        if (!p || !p->task) {
+        struct sched_task *leader = proc_thread_group_leader(p);
+        if (!leader) {
             proc_table_unlock_irqrestore(pflags);
             return -(i64) ESRCH;
         }
-        result = __atomic_load_n(&p->task->td_affinity, __ATOMIC_ACQUIRE);
+        result = __atomic_load_n(&leader->td_affinity, __ATOMIC_ACQUIRE);
         proc_table_unlock_irqrestore(pflags);
     }
 
@@ -1165,14 +1206,17 @@ static i64 sys_sched_getattr(struct trap_frame *tf, struct sched_task *td)
 }
 #endif /* CONFIG_SCHED_DEADLINE */
 
-/* SYS_SET_ROBUST_LIST: register the user-space robust futex list.
+/* SYS_SET_ROBUST_LIST: register the user-space robust futex list for
+ * the calling thread. Stored per-task because each thread holds its
+ * own locks and unwinds its own list on exit (Linux semantics).
  * a0 = pointer to robust_list_head (first entry / self = empty)
  * a1 = byte offset from entry pointer to the futex word
  * a2 = pointer to the pending entry (0 if none)
  */
 static i64 sys_set_robust_list(struct trap_frame *tf, struct sched_task *td)
 {
-    struct proc *p = td->proc;
+    if (!td)
+        return -(i64) EPERM;
     ptr head = (ptr) tf->a0;
     i32 offset = (i32) tf->a1;
     ptr pending = (ptr) tf->a2;
@@ -1188,34 +1232,37 @@ static i64 sys_set_robust_list(struct trap_frame *tf, struct sched_task *td)
     if (offset & (i32) (sizeof(u32) - 1))
         return -(i64) EINVAL;
 
-    p->robust_list_head = head;
-    p->robust_futex_offset = offset;
-    p->robust_pending = pending;
+    td->td_robust_list_head = head;
+    td->td_robust_futex_offset = offset;
+    td->td_robust_pending = pending;
     return 0;
 }
 
-/* SYS_GET_ROBUST_LIST: retrieve the current robust list registration.
+/* SYS_GET_ROBUST_LIST: retrieve the calling thread's robust list
+ * registration.
  * a0 = user pointer to store the head pointer (ptr *)
  * a1 = user pointer to store the futex offset (i32 *)
  * a2 = user pointer to store the pending pointer (ptr *)
  */
 static i64 sys_get_robust_list(struct trap_frame *tf, struct sched_task *td)
 {
-    struct proc *p = td->proc;
+    if (!td)
+        return -(i64) EPERM;
     ptr u_head = (ptr) tf->a0;
     ptr u_offset = (ptr) tf->a1;
     ptr u_pending = (ptr) tf->a2;
     i64 rc;
 
-    rc =
-        copy_to_user(u_head, &p->robust_list_head, sizeof(p->robust_list_head));
+    rc = copy_to_user(u_head, &td->td_robust_list_head,
+                      sizeof(td->td_robust_list_head));
     if (rc < 0)
         return -(i64) EFAULT;
-    rc = copy_to_user(u_offset, &p->robust_futex_offset,
-                      sizeof(p->robust_futex_offset));
+    rc = copy_to_user(u_offset, &td->td_robust_futex_offset,
+                      sizeof(td->td_robust_futex_offset));
     if (rc < 0)
         return -(i64) EFAULT;
-    rc = copy_to_user(u_pending, &p->robust_pending, sizeof(p->robust_pending));
+    rc = copy_to_user(u_pending, &td->td_robust_pending,
+                      sizeof(td->td_robust_pending));
     if (rc < 0)
         return -(i64) EFAULT;
     return 0;
@@ -1223,23 +1270,79 @@ static i64 sys_get_robust_list(struct trap_frame *tf, struct sched_task *td)
 
 /* --- PSE51 clock and nanosleep (item 15) --- */
 
-static i64 sys_clock_gettime(struct trap_frame *tf,
-                             struct sched_task *td __unused)
+/* Sum cpu_time_us across every thread of the calling proc. Caller
+ * must hold proc_table_lock so the tasks[] view is stable.
+ */
+static u64 proc_cputime_us_locked(struct proc *p)
+{
+    if (!p)
+        return 0;
+    u64 sum = p->exited_cpu_time_us;
+    u64 now_ticks = time_rdtime();
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *t = p->tasks[i];
+        if (t) {
+            sum += t->cpu_time_us;
+            if (t->state == TD_STATE_RUNNING && now_ticks >= t->switch_in_ticks)
+                sum += time_ticks_to_us(now_ticks - t->switch_in_ticks);
+        }
+    }
+    return sum;
+}
+
+static i64 cancel_thread_now(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td)
+        return -(i64) EPERM;
+    tf->a0 = (u64) -ECANCELED;
+    tf->a7 = SYS_THREAD_EXIT;
+    return syscall_dispatch(tf, td);
+}
+
+static i64 maybe_cancel_at_cancellation_point(struct trap_frame *tf,
+                                              struct sched_task *td,
+                                              i64 rc)
+{
+    if (rc == -(i64) ECANCELED && thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return rc;
+}
+
+static i64 sys_clock_gettime(struct trap_frame *tf, struct sched_task *td)
 {
     i32 clk_id = (i32) tf->a0;
     ptr u_ts = (ptr) tf->a1;
 
-    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME)
+    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME &&
+        clk_id != CLOCK_PROCESS_CPUTIME_ID && clk_id != CLOCK_THREAD_CPUTIME_ID)
         return -(i64) EINVAL;
 
-    u64 ticks = time_rdtime();
-    u64 freq = time_get_timebase_freq();
-    if (freq == 0)
-        return -(i64) EIO;
-
     struct timespec ts;
-    ts.tv_sec = (i64) (ticks / freq);
-    ts.tv_nsec = (i64) ((ticks % freq) * NSEC_PER_SEC / freq);
+    if (clk_id == CLOCK_THREAD_CPUTIME_ID) {
+        if (!td)
+            return -(i64) EPERM;
+        u64 us = td->cpu_time_us;
+        u64 now_ticks = time_rdtime();
+        if (td->state == TD_STATE_RUNNING && now_ticks >= td->switch_in_ticks)
+            us += time_ticks_to_us(now_ticks - td->switch_in_ticks);
+        ts.tv_sec = (i64) (us / 1000000ULL);
+        ts.tv_nsec = (i64) ((us % 1000000ULL) * (u64) NSEC_PER_USEC);
+    } else if (clk_id == CLOCK_PROCESS_CPUTIME_ID) {
+        if (!td || !td->proc)
+            return -(i64) EPERM;
+        u64 pflags = proc_table_lock_irqsave();
+        u64 us = proc_cputime_us_locked(td->proc);
+        proc_table_unlock_irqrestore(pflags);
+        ts.tv_sec = (i64) (us / 1000000ULL);
+        ts.tv_nsec = (i64) ((us % 1000000ULL) * (u64) NSEC_PER_USEC);
+    } else {
+        u64 ticks = time_rdtime();
+        u64 freq = time_get_timebase_freq();
+        if (freq == 0)
+            return -(i64) EIO;
+        ts.tv_sec = (i64) (ticks / freq);
+        ts.tv_nsec = (i64) ((ticks % freq) * NSEC_PER_SEC / freq);
+    }
 
     i64 rc = copy_to_user(u_ts, &ts, sizeof(ts));
     if (rc < 0)
@@ -1253,7 +1356,8 @@ static i64 sys_clock_getres(struct trap_frame *tf,
     i32 clk_id = (i32) tf->a0;
     ptr u_ts = (ptr) tf->a1;
 
-    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME)
+    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME &&
+        clk_id != CLOCK_PROCESS_CPUTIME_ID && clk_id != CLOCK_THREAD_CPUTIME_ID)
         return -(i64) EINVAL;
 
     u64 freq = time_get_timebase_freq();
@@ -1277,6 +1381,7 @@ static i64 sys_clock_getres(struct trap_frame *tf,
 static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
 {
     ptr u_req = (ptr) tf->a0;
+    ptr u_rem = (ptr) tf->a1;
 
     struct timespec req;
     i64 rc = copy_from_user(&req, u_req, sizeof(req));
@@ -1286,26 +1391,74 @@ static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
     if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= NSEC_PER_SEC)
         return -(i64) EINVAL;
 
+    /* Bound user-controlled tv_sec so neither the ns nor ms conversion
+     * can wrap u64. U64_MAX / NSEC_PER_SEC is ~18.4 billion seconds, so
+     * the cap loses no real sleep request and protects against a caller
+     * passing tv_sec near INT64_MAX (which would otherwise wrap req_ns
+     * and silently turn a multi-decade sleep into a near-zero one).
+     */
+    if ((u64) req.tv_sec > U64_MAX / (u64) NSEC_PER_SEC)
+        return -(i64) EINVAL;
+
+    /* Capture the requested duration in raw ticks so the remainder we
+     * report on EINTR is precise to the timebase, not rounded to the
+     * scheduler's millisecond grain. The kernel still sleeps in ms units
+     * because that is what callout_set_ticks expects via sleep_ms.
+     */
+    u64 freq = time_get_timebase_freq();
+    if (freq == 0)
+        return -(i64) EIO;
+    u64 req_ns = (u64) req.tv_sec * (u64) NSEC_PER_SEC + (u64) req.tv_nsec;
     u64 ms = (u64) req.tv_sec * 1000 + (u64) req.tv_nsec / NSEC_PER_MSEC;
     if (ms == 0 && req.tv_nsec > 0)
         ms = 1; /* sub-millisecond: round up to one tick */
 
-    u64 before_ms = time_current_ms().ms;
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+
+    u64 t0 = time_rdtime();
     sleep_ms(time_ms_new(ms));
-    u64 elapsed_ms = time_current_ms().ms - before_ms;
+    u64 elapsed_ticks = time_rdtime() - t0;
+    u64 elapsed_ns = (elapsed_ticks / freq) * (u64) NSEC_PER_SEC +
+                     ((elapsed_ticks % freq) * (u64) NSEC_PER_SEC) / freq;
 
-    /* If a signal woke us early, report EINTR so user-space knows the
-     * sleep was interrupted.  The trap exit path will deliver the signal.
+    /* On early wakeup by a signal, report EINTR and (when rem is
+     * non-NULL) write back the unexpired remainder. The trap exit
+     * path will deliver the signal. The remainder must be reported
+     * by the kernel: a libc shim cannot reconstruct it accurately
+     * if the thread is preempted between syscall return and the
+     * shim's clock read, which would silently violate RT deadlines.
+     *
+     * signal_has_deliverable uses atomic loads, matching the rest
+     * of the kernel's lockless fast-path read of sig_state. A raw
+     * struct read here is a data race against signal_send /
+     * signal_deliver.
+     *
+     * The remainder write is best-effort: a bad rem pointer must
+     * not mask the EINTR return because the dominant fact is that
+     * the sleep was interrupted. Returning EINTR rather than EFAULT
+     * keeps user-space retry loops on the right errno.
      */
-    if (td && td->proc &&
-        (td->proc->sig_state.pending & ~td->proc->sig_state.blocked) != 0 &&
-        elapsed_ms < ms)
-        return -(i64) EINTR;
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
 
+    if (td && signal_has_deliverable(td) && elapsed_ns < req_ns) {
+        if (u_rem) {
+            u64 rem_ns = req_ns - elapsed_ns;
+            struct timespec rem = {
+                .tv_sec = (i64) (rem_ns / (u64) NSEC_PER_SEC),
+                .tv_nsec = (i64) (rem_ns % (u64) NSEC_PER_SEC),
+            };
+            i64 cprc __unused = copy_to_user(u_rem, &rem, sizeof(rem));
+        }
+        return -(i64) EINTR;
+    }
+
+    /* Normal completion: POSIX/Linux leave *rem unmodified. */
     return 0;
 }
 
-/* --- PSE51 memory locking -- no-ops on bare metal (item 15e) --- */
+/* --- PSE51 memory locking: no-ops on bare metal --- */
 
 static i64 sys_mlockall(struct trap_frame *tf __unused,
                         struct sched_task *td __unused)
@@ -1317,6 +1470,66 @@ static i64 sys_munlockall(struct trap_frame *tf __unused,
                           struct sched_task *td __unused)
 {
     return 0;
+}
+
+/* mlock(addr, len) / munlock(addr, len): PSE51 requires the range form
+ * even when memory is permanently resident. The kernel validates the
+ * range overlaps user space, then returns success without touching any
+ * page-table state.  EINVAL on zero length or addr+len overflow,
+ * matching POSIX (Linux returns EINVAL for empty / wrap).
+ */
+static i64 sys_mlock_munlock_common(ptr addr, sz len)
+{
+    if (len == 0)
+        return -(i64) EINVAL;
+    if ((uptr) addr > (uptr) (U64_MAX - (u64) len))
+        return -(i64) EINVAL;
+    if (!user_addr_valid(addr, len))
+        return -(i64) ENOMEM;
+    return 0;
+}
+
+static i64 sys_mlock(struct trap_frame *tf, struct sched_task *td __unused)
+{
+    return sys_mlock_munlock_common((ptr) tf->a0, (sz) tf->a1);
+}
+
+static i64 sys_munlock(struct trap_frame *tf, struct sched_task *td __unused)
+{
+    return sys_mlock_munlock_common((ptr) tf->a0, (sz) tf->a1);
+}
+
+/* fsync(fd) / fdatasync(fd): PSE51 mandates _POSIX_FSYNC. The
+ * disk-backed SFS already commits writes synchronously internally
+ * (see kernel/fs/sfs.c); the synthetic and RAM filesystems have no
+ * backing store. Validate the FD is open, reject pipe FDs (POSIX
+ * specifies EINVAL for file types that do not support synchronized
+ * I/O, matching Linux), return success.
+ */
+static i64 sys_fsync_common(struct sched_task *td, i32 fd)
+{
+    struct proc *p = td ? td->proc : NULL;
+    if (!p || !validate_fd_number(fd))
+        return -(i64) EBADF;
+    u64 flags = proc_fd_lock_irqsave(p);
+    bool open = p->fd_table[fd].is_open;
+    bool is_pipe = p->fd_table[fd].is_pipe;
+    proc_fd_unlock_irqrestore(p, flags);
+    if (!open)
+        return -(i64) EBADF;
+    if (is_pipe)
+        return -(i64) EINVAL;
+    return 0;
+}
+
+static i64 sys_fsync(struct trap_frame *tf, struct sched_task *td)
+{
+    return sys_fsync_common(td, (i32) tf->a0);
+}
+
+static i64 sys_fdatasync(struct trap_frame *tf, struct sched_task *td)
+{
+    return sys_fsync_common(td, (i32) tf->a0);
 }
 
 /* --- PSE51 synchronization syscalls (item 15a) --- */
@@ -1335,7 +1548,10 @@ static i64 sys_mutex_lock_h(struct trap_frame *tf,
     struct pi_mutex *mtx = sync_mutex_get(handle, td->proc);
     if (!mtx)
         return -(i64) EINVAL;
-    return (i64) pi_mutex_lock_interruptible(mtx);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) pi_mutex_lock_interruptible(mtx));
 }
 
 static i64 sys_mutex_trylock_h(struct trap_frame *tf,
@@ -1375,7 +1591,89 @@ static i64 sys_cond_wait_h(struct trap_frame *tf,
     struct pi_mutex *mtx = sync_mutex_get(mtx_h, td->proc);
     if (!cv || !mtx)
         return -(i64) EINVAL;
-    return (i64) condvar_wait(cv, mtx);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(tf, td,
+                                              (i64) condvar_wait(cv, mtx));
+}
+
+/* Convert an absolute CLOCK_MONOTONIC timespec (in user space) to a
+ * relative time_ms suitable for the kernel timed-wait primitives.
+ *
+ * On success returns 0 and writes the relative timeout to *out_ms.
+ * Returns -EINVAL for malformed timespec, -EFAULT for a bad user
+ * pointer, -ETIMEDOUT if the deadline has already passed (the
+ * caller should short-circuit immediately rather than enter a
+ * zero-length wait that would block forever on some primitives).
+ *
+ * Rationale: pushing this conversion into a libc shim is racy under
+ * preemption: a thread reading clock_gettime in user space, then
+ * subtracting and entering the kernel, can be preempted between the
+ * two and silently miss its deadline. Doing the conversion at the
+ * syscall entry gives a tighter window (a few instructions) and
+ * matches POSIX semantics for absolute timed waits.
+ */
+/* Convert a user-supplied absolute timespec on the named clock to a
+ * relative time_ms suitable for the kernel's monotonic timed-wait
+ * primitives.  Today CLOCK_MONOTONIC and CLOCK_REALTIME share the
+ * same epoch, so the conversion is identity; the clk_id parameter
+ * is plumbed so adding a real RTC offset later is a one-place change
+ * rather than a silent semantic break for every caller.  Returns 0
+ * on success, -ETIMEDOUT if the deadline already passed,
+ * -EINVAL / -EFAULT / -EIO on bad input.
+ */
+static i64 timed_wait_abs_to_rel(i32 clk_id,
+                                 ptr u_abs_ts,
+                                 struct time_ms *out_ms)
+{
+    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME)
+        return -(i64) EINVAL;
+
+    if (!u_abs_ts) {
+        *out_ms = time_ms_new(TIME_MS_MAX);
+        return 0;
+    }
+    struct timespec abs;
+    i64 rc = copy_from_user(&abs, u_abs_ts, sizeof(abs));
+    if (rc < 0)
+        return rc;
+    if (abs.tv_sec < 0 || abs.tv_nsec < 0 || abs.tv_nsec >= NSEC_PER_SEC)
+        return -(i64) EINVAL;
+
+    u64 freq = time_get_timebase_freq();
+    if (freq == 0)
+        return -(i64) EIO;
+    u64 now_ticks = time_rdtime();
+    u64 now_sec = now_ticks / freq;
+    u64 now_nsec = (now_ticks % freq) * (u64) NSEC_PER_SEC / freq;
+
+    /* CLOCK_REALTIME translation hook: today the realtime clock is
+     * anchored to the same monotonic ticks, so no offset is applied.
+     * If/when a real wall-clock offset lands, subtract it here for
+     * CLOCK_REALTIME and translate the user deadline back into the
+     * monotonic timebase.
+     */
+    (void) clk_id; /* placeholder; see comment above */
+
+    if ((u64) abs.tv_sec < now_sec ||
+        ((u64) abs.tv_sec == now_sec && (u64) abs.tv_nsec <= now_nsec))
+        return -(i64) ETIMEDOUT;
+
+    u64 diff_sec = (u64) abs.tv_sec - now_sec;
+    i64 diff_nsec = abs.tv_nsec - (i64) now_nsec;
+    if (diff_nsec < 0) {
+        diff_sec -= 1;
+        diff_nsec += NSEC_PER_SEC;
+    }
+    if (diff_sec > TIME_MS_MAX / 1000ULL) {
+        *out_ms = time_ms_new(TIME_MS_MAX);
+        return 0;
+    }
+    u64 ms = diff_sec * 1000ULL + (u64) diff_nsec / (u64) NSEC_PER_MSEC;
+    if (((u64) diff_nsec % (u64) NSEC_PER_MSEC) != 0)
+        ms += 1;
+    *out_ms = time_ms_new(ms);
+    return 0;
 }
 
 static i64 sys_cond_timedwait_h(struct trap_frame *tf,
@@ -1383,12 +1681,19 @@ static i64 sys_cond_timedwait_h(struct trap_frame *tf,
 {
     i32 cv_h = (i32) tf->a0;
     i32 mtx_h = (i32) tf->a1;
-    u64 timeout_ms = tf->a2;
+    ptr u_abs_ts = (ptr) tf->a2;
+    struct time_ms timeout;
+    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+    if (rc < 0)
+        return rc;
     struct condvar *cv = sync_condvar_get(cv_h, td->proc);
     struct pi_mutex *mtx = sync_mutex_get(mtx_h, td->proc);
     if (!cv || !mtx)
         return -(i64) EINVAL;
-    return (i64) condvar_wait_timeout(cv, mtx, time_ms_new(timeout_ms));
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) condvar_wait_timeout(cv, mtx, timeout));
 }
 
 static i64 sys_cond_signal_h(struct trap_frame *tf,
@@ -1426,7 +1731,10 @@ static i64 sys_sem_wait_h(struct trap_frame *tf, struct sched_task *td __unused)
     struct semaphore *s = sync_sem_get(handle, td->proc);
     if (!s)
         return -(i64) EINVAL;
-    return (i64) sem_wait_interruptible(s);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(tf, td,
+                                              (i64) sem_wait_interruptible(s));
 }
 
 static i64 sys_sem_trywait_h(struct trap_frame *tf,
@@ -1453,11 +1761,18 @@ static i64 sys_sem_timedwait_h(struct trap_frame *tf,
                                struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    u64 timeout_ms = tf->a1;
+    ptr u_abs_ts = (ptr) tf->a1;
+    struct time_ms timeout;
+    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+    if (rc < 0)
+        return rc;
     struct semaphore *s = sync_sem_get(handle, td->proc);
     if (!s)
         return -(i64) EINVAL;
-    return (i64) sem_timedwait(s, time_ms_new(timeout_ms));
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(tf, td,
+                                              (i64) sem_timedwait(s, timeout));
 }
 
 /* --- POSIX barriers (item 15i) --- */
@@ -1477,7 +1792,10 @@ static i64 sys_barrier_wait_h(struct trap_frame *tf,
     struct barrier *b = sync_barrier_get(handle, td->proc);
     if (!b)
         return -(i64) EINVAL;
-    return (i64) barrier_wait_interruptible(b);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) barrier_wait_interruptible(b));
 }
 
 static i64 sys_barrier_destroy_h(struct trap_frame *tf,
@@ -1509,7 +1827,10 @@ static i64 sys_rwlock_rdlock_h(struct trap_frame *tf,
     struct rwlock *rw = sync_rwlock_get(handle, td->proc);
     if (!rw)
         return -(i64) EINVAL;
-    return (i64) rwlock_rdlock_interruptible(rw);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) rwlock_rdlock_interruptible(rw));
 }
 
 static i64 sys_rwlock_wrlock_h(struct trap_frame *tf,
@@ -1519,7 +1840,10 @@ static i64 sys_rwlock_wrlock_h(struct trap_frame *tf,
     struct rwlock *rw = sync_rwlock_get(handle, td->proc);
     if (!rw)
         return -(i64) EINVAL;
-    return (i64) rwlock_wrlock_interruptible(rw);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) rwlock_wrlock_interruptible(rw));
 }
 
 static i64 sys_rwlock_tryrdlock_h(struct trap_frame *tf,
@@ -1557,22 +1881,36 @@ static i64 sys_rwlock_timedrdlock_h(struct trap_frame *tf,
                                     struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    u64 timeout_ms = tf->a1;
+    ptr u_abs_ts = (ptr) tf->a1;
+    struct time_ms timeout;
+    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+    if (rc < 0)
+        return rc;
     struct rwlock *rw = sync_rwlock_get(handle, td->proc);
     if (!rw)
         return -(i64) EINVAL;
-    return (i64) rwlock_timedrdlock(rw, time_ms_new(timeout_ms));
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) rwlock_timedrdlock(rw, timeout));
 }
 
 static i64 sys_rwlock_timedwrlock_h(struct trap_frame *tf,
                                     struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    u64 timeout_ms = tf->a1;
+    ptr u_abs_ts = (ptr) tf->a1;
+    struct time_ms timeout;
+    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+    if (rc < 0)
+        return rc;
     struct rwlock *rw = sync_rwlock_get(handle, td->proc);
     if (!rw)
         return -(i64) EINVAL;
-    return (i64) rwlock_timedwrlock(rw, time_ms_new(timeout_ms));
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) rwlock_timedwrlock(rw, timeout));
 }
 
 static i64 sys_rwlock_destroy_h(struct trap_frame *tf,
@@ -1625,7 +1963,10 @@ static i64 sys_mq_send(struct trap_frame *tf, struct sched_task *td)
     if (rc < 0)
         return rc;
 
-    return (i64) mqueue_send(handle, kbuf, len, priority);
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return maybe_cancel_at_cancellation_point(
+        tf, td, (i64) mqueue_send(handle, kbuf, len, priority));
 }
 
 static i64 sys_mq_receive(struct trap_frame *tf, struct sched_task *td)
@@ -1641,11 +1982,14 @@ static i64 sys_mq_receive(struct trap_frame *tf, struct sched_task *td)
     if (buf_size <= 0 || buf_size > MQ_MAX_MSG_SIZE)
         return -(i64) EINVAL;
 
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+
     u8 kbuf[MQ_MAX_MSG_SIZE];
     u32 prio = 0;
     i32 ret = mqueue_receive(handle, kbuf, buf_size, &prio);
     if (ret < 0)
-        return (i64) ret;
+        return maybe_cancel_at_cancellation_point(tf, td, (i64) ret);
 
     i64 rc = copy_to_user(u_buf, kbuf, (sz) ret);
     if (rc < 0)
@@ -1667,17 +2011,24 @@ static i64 sys_mq_timedreceive(struct trap_frame *tf, struct sched_task *td)
     ptr u_buf = (ptr) tf->a1;
     sz buf_size = (sz) tf->a2;
     ptr u_prio = (ptr) tf->a3;
-    u64 timeout_ms = tf->a4;
+    ptr u_abs_ts = (ptr) tf->a4;
 
     if (buf_size <= 0 || buf_size > MQ_MAX_MSG_SIZE)
         return -(i64) EINVAL;
 
+    struct time_ms timeout;
+    i64 trc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+    if (trc < 0)
+        return trc;
+
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+
     u8 kbuf[MQ_MAX_MSG_SIZE];
     u32 prio = 0;
-    i32 ret = mqueue_timedreceive(handle, kbuf, buf_size, &prio,
-                                  time_ms_new(timeout_ms));
+    i32 ret = mqueue_timedreceive(handle, kbuf, buf_size, &prio, timeout);
     if (ret < 0)
-        return (i64) ret;
+        return maybe_cancel_at_cancellation_point(tf, td, (i64) ret);
 
     i64 rc = copy_to_user(u_buf, kbuf, (sz) ret);
     if (rc < 0)
@@ -1756,6 +2107,276 @@ static i64 sys_kill_h(struct trap_frame *tf, struct sched_task *td __unused)
     return (i64) signal_send(target, signo);
 }
 
+/* Forward declaration; defined alongside the other thread syscalls
+ * later in the file.
+ */
+static struct sched_task *thread_find_by_tid_locked(struct proc *p, u16 tid);
+
+static bool thread_target_is_live(const struct sched_task *target);
+
+/* pthread_kill: thread-directed signal delivery within the calling
+ * proc. Differs from kill(): the bit lands on a specific thread's
+ * td_sig.pending rather than the per-proc proc_pending mask, so the
+ * signal targets exactly that thread. Unknown TID -> ESRCH; signo==0
+ * is an existence check. SIGKILL is process-wide by definition and
+ * is rejected with EINVAL since pthread_kill targeting a single
+ * thread cannot meaningfully forward it.
+ */
+static i64 sys_pthread_kill_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    u16 tid = (u16) tf->a0;
+    i32 signo = (i32) tf->a1;
+    struct proc *p = td->proc;
+
+    if (signo < 0 || signo >= SIG_MAX)
+        return -(i64) EINVAL;
+    if (signo == SIGKILL)
+        return -(i64) EINVAL;
+
+    struct sched_task *target = NULL;
+
+    u64 tflags = proc_table_lock_irqsave();
+    target = thread_find_by_tid_locked(p, tid);
+    if (!thread_target_is_live(target)) {
+        proc_table_unlock_irqrestore(tflags);
+        return -(i64) ESRCH;
+    }
+    if (signo != 0) {
+        u64 sflags = proc_sig_lock_irqsave(p);
+        __atomic_or_fetch(&target->td_sig.pending, sig_bit(signo),
+                          __ATOMIC_RELAXED);
+        proc_sig_unlock_irqrestore(p, sflags);
+        if (target->state == TD_STATE_SLEEPING)
+            sched_wake_sleeping(target);
+    }
+    proc_table_unlock_irqrestore(tflags);
+    return 0;
+}
+
+/* pthread_sigmask: identical wire shape to SYS_SIGPROCMASK. Both
+ * operate on the calling thread's td_sig.blocked. Exposed under a
+ * separate syscall number so userspace libc can keep
+ * pthread_sigmask and sigprocmask as distinct ABI surfaces, even
+ * though Mazu's storage is already per-thread.
+ */
+static i64 sys_sigprocmask_h(struct trap_frame *tf, struct sched_task *td);
+static i64 sys_pthread_sigmask_h(struct trap_frame *tf, struct sched_task *td)
+{
+    return sys_sigprocmask_h(tf, td);
+}
+
+/* sigsuspend(set):
+ *   replace td_sig.blocked with *set, sleep until a non-masked
+ *   signal becomes deliverable, then return -EINTR. POSIX
+ *   requires the pre-call mask to be restored before user space
+ *   resumes; signal_deliver / SIG_IGN handle that via
+ *   td_sig.sigsuspend_saved_blocked, so the mask is NOT restored
+ *   here. If trap exit finds that another thread consumed the
+ *   pending bit before this thread reaches return-to-user,
+ *   signal_deliver still restores the saved mask via
+ *   sigsuspend_active.
+ *   a0 = user pointer to u32 set.
+ */
+static i64 sys_sigsuspend_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    ptr u_set = (ptr) tf->a0;
+    if (!u_set)
+        return -(i64) EFAULT;
+    u32 new_mask;
+    i64 rc = copy_from_user(&new_mask, u_set, sizeof(new_mask));
+    if (rc < 0)
+        return rc;
+    /* SIGKILL must not be blocked. */
+    new_mask &= ~sig_bit(SIGKILL);
+
+    struct proc *p = td->proc;
+    u64 sflags = proc_sig_lock_irqsave(p);
+    td->td_sig.sigsuspend_saved_blocked = td->td_sig.blocked;
+    td->td_sig.sigsuspend_active = true;
+    td->td_sig.blocked = new_mask;
+    proc_sig_unlock_irqrestore(p, sflags);
+
+    /* Park in TD_STATE_SLEEPING with a maximal duration so the
+     * scheduler does not loop the runqueue burning CPU. signal_send
+     * calls signal_interrupt_task -> sched_wake_sleeping when a
+     * signal arrives, which short-circuits the sleep.
+     */
+    while (!signal_has_deliverable(td))
+        sleep_ms(time_ms_new(TIME_MS_MAX));
+
+    return -(i64) EINTR;
+}
+
+/* sigtimedwait(set, info, timeout):
+ *   block until any signal in *set becomes pending; on success,
+ *   atomically dequeue that signal (without invoking its handler) and
+ *   write its number to *info (just the signo, since Mazu signals
+ *   carry no siginfo payload). Returns the signal number on success,
+ *   or -EAGAIN on timeout, -EINTR if a non-set signal arrives.
+ *   a0 = user *u32 set, a1 = user *i32 signo_out (NULL ok),
+ *   a2 = user *struct timespec timeout (NULL = wait forever).
+ */
+static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    ptr u_set = (ptr) tf->a0;
+    ptr u_signo_out = (ptr) tf->a1;
+    ptr u_timeout = (ptr) tf->a2;
+
+    if (!u_set)
+        return -(i64) EFAULT;
+    u32 set;
+    i64 rc = copy_from_user(&set, u_set, sizeof(set));
+    if (rc < 0)
+        return rc;
+    /* SIGKILL is never wait-dequeueable; mask it out. */
+    set &= ~sig_bit(SIGKILL);
+    if (set == 0)
+        return -(i64) EINVAL;
+
+    /* Pre-validate u_signo_out before dequeuing the signal. A bad
+     * pointer must NOT cause the bit to be cleared and then the
+     * signal lost via -EFAULT; once dequeued the signal cannot be
+     * delivered to a handler.
+     */
+    if (u_signo_out && !user_addr_writable(u_signo_out, sizeof(i32)))
+        return -(i64) EFAULT;
+
+    /* Compute a monotonic deadline once. NULL timeout = no deadline.
+     * Bound tv_sec so the (tv_sec * freq) and (now + add_ticks)
+     * computations cannot wrap u64 and silently turn a long timeout
+     * into an immediate one.
+     */
+    bool have_deadline = (u_timeout != 0);
+    u64 deadline_ticks = 0;
+    u64 timeout_ms = TIME_MS_MAX;
+    if (have_deadline) {
+        struct timespec ts;
+        rc = copy_from_user(&ts, u_timeout, sizeof(ts));
+        if (rc < 0)
+            return rc;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC)
+            return -(i64) EINVAL;
+        u64 freq = time_get_timebase_freq();
+        if (freq == 0)
+            return -(i64) EIO;
+        /* tv_sec * freq must not overflow u64. */
+        if ((u64) ts.tv_sec > U64_MAX / freq)
+            return -(i64) EINVAL;
+        u64 add_ticks = (u64) ts.tv_sec * freq +
+                        ((u64) ts.tv_nsec * freq) / (u64) NSEC_PER_SEC;
+        u64 now = time_rdtime();
+        if (add_ticks > U64_MAX - now)
+            deadline_ticks = U64_MAX;
+        else
+            deadline_ticks = now + add_ticks;
+        /* Compute the matching ms timeout for sleep_ms.  Round up
+         * sub-ms remainders so the wait is at least the requested
+         * duration.
+         */
+        u64 ms =
+            (u64) ts.tv_sec * 1000ULL + (u64) ts.tv_nsec / (u64) NSEC_PER_MSEC;
+        if (((u64) ts.tv_nsec % (u64) NSEC_PER_MSEC) != 0)
+            ms += 1;
+        timeout_ms = ms;
+    }
+
+    struct proc *p = td->proc;
+
+    /* Tell signal_send-style writers what set this thread is parked
+     * on, so a non-matching signal does not need to interrupt the
+     * sleep. signal_interrupt_task still wakes for matching signals
+     * (its sleep is woken by sched_wake_sleeping).
+     */
+    u64 sflags = proc_sig_lock_irqsave(p);
+    td->td_sig.sigwait_set = set;
+    proc_sig_unlock_irqrestore(p, sflags);
+
+    i64 result = 0;
+    i32 dequeued_signo = 0;
+    for (;;) {
+        sflags = proc_sig_lock_irqsave(p);
+        u32 thread_pending = td->td_sig.pending;
+        u32 proc_pending = p->sig_state.proc_pending;
+        u32 candidate = (thread_pending | proc_pending) & set;
+        if (candidate != 0) {
+            i32 signo = 0;
+            for (i32 i = 1; i < SIG_MAX; i++) {
+                if (candidate & sig_bit(i)) {
+                    signo = i;
+                    break;
+                }
+            }
+            if (thread_pending & sig_bit(signo))
+                td->td_sig.pending &= ~sig_bit(signo);
+            else
+                p->sig_state.proc_pending &= ~sig_bit(signo);
+            td->td_sig.sigwait_set = 0;
+            proc_sig_unlock_irqrestore(p, sflags);
+            dequeued_signo = signo;
+            result = (i64) signo;
+            break;
+        }
+        /* Out-of-set unblocked signal -> -EINTR per POSIX. */
+        u32 deliverable_other =
+            (thread_pending | proc_pending) & ~td->td_sig.blocked & ~set;
+        if (deliverable_other != 0) {
+            td->td_sig.sigwait_set = 0;
+            proc_sig_unlock_irqrestore(p, sflags);
+            return -(i64) EINTR;
+        }
+        proc_sig_unlock_irqrestore(p, sflags);
+
+        if (have_deadline) {
+            u64 now = time_rdtime();
+            if (now >= deadline_ticks) {
+                sflags = proc_sig_lock_irqsave(p);
+                td->td_sig.sigwait_set = 0;
+                proc_sig_unlock_irqrestore(p, sflags);
+                return -(i64) EAGAIN;
+            }
+            /* Sleep for the remaining time; signal_send will wake
+             * the sleep via signal_interrupt_task -> sched_wake_
+             * sleeping when a deliverable signal arrives.
+             */
+            u64 remaining = deadline_ticks - now;
+            u64 freq = time_get_timebase_freq();
+            u64 rem_ms = remaining / (freq / 1000ULL ? freq / 1000ULL : 1);
+            if (rem_ms == 0)
+                rem_ms = 1;
+            sleep_ms(time_ms_new(rem_ms));
+        } else {
+            sleep_ms(time_ms_new(timeout_ms));
+        }
+    }
+
+    /* Write the signo out-of-line. u_signo_out was pre-validated so
+     * a fault here is unlikely; if it does fault (concurrent munmap
+     * after validation), re-queue the bit so the caller can retry.
+     */
+    if (u_signo_out) {
+        i64 cprc =
+            copy_to_user(u_signo_out, &dequeued_signo, sizeof(dequeued_signo));
+        if (cprc < 0) {
+            sflags = proc_sig_lock_irqsave(p);
+            /* Restore on the per-thread mask (a thread-directed
+             * deliver was either consumed here or was process-wide
+             * and is best preserved per-thread to avoid a feedback
+             * loop with signal_pick_wake_target).
+             */
+            td->td_sig.pending |= sig_bit(dequeued_signo);
+            proc_sig_unlock_irqrestore(p, sflags);
+            return cprc;
+        }
+    }
+    return result;
+}
+
 static i64 sys_sigaction_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
@@ -1782,39 +2403,328 @@ static i64 sys_sigreturn_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    return (i64) signal_return(td->proc, tf);
+    return (i64) signal_return(td, tf);
+}
+
+/* sigprocmask(how, new, old): operates on the calling thread's blocked
+ * mask (per-task td_sig.blocked since the per-thread state migration).
+ * Today PROC_THREAD_MAX == 1 so this is observably indistinguishable
+ * from a per-process mask, but the storage is already per-thread; once
+ * pthread_create lands, this remains the right ABI for pthread_sigmask.
+ * SIGKILL cannot be blocked, matching POSIX.
+ */
+static i64 sys_sigprocmask_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    i32 how = (i32) tf->a0;
+    ptr u_set = (ptr) tf->a1;
+    ptr u_old = (ptr) tf->a2;
+    struct proc *p = td->proc;
+
+    u32 set = 0;
+    bool have_set = u_set != 0;
+    if (have_set && how != SIG_BLOCK && how != SIG_UNBLOCK &&
+        how != SIG_SETMASK)
+        return -(i64) EINVAL;
+    if (have_set) {
+        i64 rc = copy_from_user(&set, u_set, sizeof(set));
+        if (rc < 0)
+            return rc;
+    }
+
+    /* POSIX: "If sigprocmask() fails, the signal mask of the process
+     * shall not be changed." Pre-validate the user out pointer before
+     * mutating kernel state so a bad u_old does not leave the mask in
+     * a half-applied state.
+     */
+    if (u_old && !user_addr_writable(u_old, sizeof(u32)))
+        return -(i64) EFAULT;
+
+    u64 flags = proc_sig_lock_irqsave(p);
+    u32 old = td->td_sig.blocked;
+    if (have_set) {
+        u32 new_mask;
+        switch (how) {
+        case SIG_BLOCK:
+            new_mask = old | set;
+            break;
+        case SIG_UNBLOCK:
+            new_mask = old & ~set;
+            break;
+        default: /* SIG_SETMASK */
+            new_mask = set;
+            break;
+        }
+        /* SIGKILL cannot be blocked. Mask the bit even if user asked. */
+        new_mask &= ~sig_bit(SIGKILL);
+        td->td_sig.blocked = new_mask;
+    }
+    proc_sig_unlock_irqrestore(p, flags);
+
+    if (u_old) {
+        /* Pre-validated above, so this should not fault; surface any
+         * residual error rather than papering over it because the mask
+         * change is already committed and cannot be undone here.
+         */
+        i64 rc = copy_to_user(u_old, &old, sizeof(old));
+        if (rc < 0)
+            return rc;
+    }
+    return 0;
 }
 
 /* --- Thread management (item 15d) --- */
 
-/* Thread creation is deferred: struct proc currently tracks a single p->task.
- * Creating a second thread overwrites that pointer, breaking signal delivery,
- * process exit, and every operation that walks p->task.  Until the proc model
- * supports a per-process task list (depends on item 21b VA isolation), this
- * syscall returns -ENOSYS.
+/* PSE51 user threads.  PROC_THREAD_MAX bounds the per-process task
+ * list; sched_create_user_thread allocates a new task in the calling
+ * proc, runs it on its own per-thread stack inside the proc VA
+ * window, and returns the kernel TID via td->id.  Lifecycle:
+ *
+ *   create  -> JOINABLE
+ *   detach  -> DETACHED  (no one will join; auto-cleans on exit)
+ *   exit    -> EXITED    (waiting for join, or auto-reaped if detached)
+ *   join    -> REAPED    (joiner has consumed the exit code)
+ *
+ * The per-process disposition table, FD table, signal disposition,
+ * and timer ownership stay on struct proc; per-thread state
+ * (sig pending/blocked, signal-frame chain, robust futex,
+ * exit_code, join waitqueue) lives on struct sched_task.
  */
-static i64 sys_thread_create_h(struct trap_frame *tf __unused,
-                               struct sched_task *td __unused)
+static i64 sys_thread_create_h(struct trap_frame *tf, struct sched_task *td)
 {
-    return -(i64) ENOSYS;
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    ptr u_entry = (ptr) tf->a0;
+    ptr u_arg = (ptr) tf->a1;
+    /* Inherit creator's base priority unless caller specifies one. */
+    u8 prio = td->td_base_prio;
+
+    /* Validate the entry point is in an executable VMA. The arg is
+     * an opaque pointer the user passes through; do not validate it.
+     */
+    if (!proc_vma_check_access(td->proc, u_entry, 1, VMA_PERM_EXEC))
+        return -(i64) EFAULT;
+
+    struct sched_task *new_td = NULL;
+    u32 inherited_sigmask =
+        __atomic_load_n(&td->td_sig.blocked, __ATOMIC_RELAXED);
+    i32 rc = sched_create_user_thread(td->proc, u_entry, u_arg, prio,
+                                      inherited_sigmask, &new_td);
+    if (rc < 0)
+        return (i64) rc;
+    return (i64) new_td->id;
 }
 
-static i64 sys_thread_join_h(struct trap_frame *tf __unused,
-                             struct sched_task *td __unused)
+/* Find the proc-attached thread with the given kernel TID. Caller
+ * must hold proc_table_lock. Returns NULL if no such thread is
+ * attached (it may have been detached and reaped already).
+ */
+static struct sched_task *thread_find_by_tid_locked(struct proc *p, u16 tid)
 {
-    return -(i64) ENOSYS;
+    if (!p)
+        return NULL;
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *t = p->tasks[i];
+        if (t && t->id == tid)
+            return t;
+    }
+    return NULL;
 }
 
-static i64 sys_thread_detach_h(struct trap_frame *tf __unused,
-                               struct sched_task *td __unused)
+static bool thread_target_is_live(const struct sched_task *target)
 {
-    return -(i64) ENOSYS;
+    if (!target)
+        return false;
+    u8 join_state =
+        __atomic_load_n((u8 *) &target->td_join_state, __ATOMIC_ACQUIRE);
+    if (join_state == TD_JOIN_EXITED || join_state == TD_JOIN_REAPED)
+        return false;
+    if (target->state == TD_STATE_TERMINATING)
+        return false;
+    return true;
 }
 
-static i64 sys_thread_exit_h(struct trap_frame *tf __unused,
-                             struct sched_task *td __unused)
+/* Atomically claim the EXITED -> REAPED transition. Returns true if
+ * this caller won the claim (and is now responsible for the final
+ * free). All single-byte loads/stores are tear-free; cmpxchg
+ * serializes against a concurrent detach or proc_exit racing for the
+ * same transition.
+ */
+static bool thread_claim_reap(struct sched_task *target)
 {
-    return -(i64) ENOSYS;
+    u8 prev = (u8) TD_JOIN_EXITED;
+    u8 next = (u8) TD_JOIN_REAPED;
+    return __atomic_compare_exchange_n((u8 *) &target->td_join_state, &prev,
+                                       next, false, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_RELAXED);
+}
+
+static bool thread_join_wait_done_locked(struct proc *p, u16 tid)
+{
+    struct sched_task *target = thread_find_by_tid_locked(p, tid);
+
+    return !target || target->td_join_state != TD_JOIN_JOINABLE;
+}
+
+static bool thread_join_wait_done(struct proc *p, u16 tid)
+{
+    u64 flags = proc_table_lock_irqsave();
+    bool done = thread_join_wait_done_locked(p, tid);
+    proc_table_unlock_irqrestore(flags);
+    return done;
+}
+
+static i64 sys_thread_join_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    u16 tid = (u16) tf->a0;
+    ptr u_exit_code = (ptr) tf->a1;
+    struct proc *p = td->proc;
+
+    /* pthread_join(self) -> EDEADLK per POSIX. */
+    if (tid == td->id)
+        return -(i64) EDEADLK;
+
+    for (;;) {
+        struct sched_task *target = NULL;
+        i32 join_state = TD_JOIN_FREE;
+        i32 exit_code = 0;
+
+        u64 pflags = proc_table_lock_irqsave();
+        target = thread_find_by_tid_locked(p, tid);
+        if (target) {
+            join_state = (i32) __atomic_load_n((u8 *) &target->td_join_state,
+                                               __ATOMIC_ACQUIRE);
+            if (join_state == TD_JOIN_EXITED) {
+                if (u_exit_code &&
+                    !user_addr_writable(u_exit_code, sizeof(i32))) {
+                    proc_table_unlock_irqrestore(pflags);
+                    return -(i64) EFAULT;
+                }
+                exit_code = target->td_exit_code;
+                if (thread_claim_reap(target)) {
+                    proc_reap_exited_thread_locked(p, target);
+                    proc_table_unlock_irqrestore(pflags);
+                    wake_up(&p->thread_event_wq, I32_MAX);
+                    sched_reap_user_thread(target);
+                    if (u_exit_code) {
+                        i64 rc = copy_to_user(u_exit_code, &exit_code,
+                                              sizeof(exit_code));
+                        if (rc < 0)
+                            return rc;
+                    }
+                    return 0;
+                }
+                join_state = (i32) __atomic_load_n(
+                    (u8 *) &target->td_join_state, __ATOMIC_ACQUIRE);
+            }
+        }
+        proc_table_unlock_irqrestore(pflags);
+
+        if (!target)
+            return -(i64) ESRCH;
+        if (join_state == TD_JOIN_DETACHED || join_state == TD_JOIN_REAPED)
+            return -(i64) EINVAL;
+        if (join_state == TD_JOIN_EXITED)
+            return -(i64) EINVAL;
+
+        /* JOINABLE: block on a process-stable waitqueue, then re-lookup
+         * the target under proc_table_lock. The target task itself may be
+         * detached and reaped while we sleep, so waiting on td_join_wq
+         * would let a concurrent free race this dereference.
+         */
+        enum wait_unblock_reason reason;
+        wait_event_reason(p->thread_event_wq, thread_join_wait_done(p, tid),
+                          reason);
+        if (wait_unblock_is_terminal(reason))
+            return -(i64) EINTR;
+        /* Loop back: re-take the locks and observe the new state. */
+    }
+}
+
+static i64 sys_thread_detach_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    u16 tid = (u16) tf->a0;
+    struct proc *p = td->proc;
+
+    u64 pflags = proc_table_lock_irqsave();
+    struct sched_task *target = thread_find_by_tid_locked(p, tid);
+    if (!target) {
+        proc_table_unlock_irqrestore(pflags);
+        return -(i64) ESRCH;
+    }
+    /* Try the JOINABLE -> DETACHED transition first; if it succeeds
+     * the task is alive (or transitioning) and sched_destroy_dead_
+     * task will see DETACHED and free without going through EXITED.
+     */
+    u8 expect = (u8) TD_JOIN_JOINABLE;
+    bool claimed_join = __atomic_compare_exchange_n(
+        (u8 *) &target->td_join_state, &expect, (u8) TD_JOIN_DETACHED, false,
+        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    bool claimed_reap = false;
+    if (!claimed_join)
+        claimed_reap = thread_claim_reap(target);
+    if (claimed_reap)
+        proc_reap_exited_thread_locked(p, target);
+    proc_table_unlock_irqrestore(pflags);
+
+    if (claimed_join) {
+        /* Wake any pending joiners so they observe DETACHED and
+         * return EINVAL.
+         */
+        wake_up(&target->td_join_wq, I32_MAX);
+        wake_up(&p->thread_event_wq, I32_MAX);
+        return 0;
+    }
+    if (claimed_reap) {
+        /* Target already exited; this caller wins the reap. */
+        wake_up(&p->thread_event_wq, I32_MAX);
+        sched_reap_user_thread(target);
+        return 0;
+    }
+    /* Already DETACHED or REAPED. */
+    return -(i64) EINVAL;
+}
+
+static i64 sys_thread_exit_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    i32 code = (i32) tf->a0;
+    struct proc *p = td->proc;
+
+    /* Last-thread exit collapses to whole-process exit so a process
+     * with only worker threads still releases its proc slot.
+     */
+    bool last_thread = false;
+    u64 pflags = proc_table_lock_irqsave();
+    td->td_exit_code = code;
+    td->td_exit_started = true;
+    u8 live_threads = 0;
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *other = p->tasks[i];
+        if (!other || other == td)
+            continue;
+        if (!other->td_exit_started)
+            live_threads++;
+    }
+    if (live_threads == 0)
+        last_thread = true;
+    proc_table_unlock_irqrestore(pflags);
+
+    if (last_thread) {
+        proc_exit(p, code);
+        sched_set_task_state(td, TD_STATE_TERMINATING);
+        return 0;
+    }
+
+    futex_exit_robust_list_task(td);
+    sched_set_task_state(td, TD_STATE_TERMINATING);
+    return 0;
 }
 
 static i64 sys_thread_self_h(struct trap_frame *tf __unused,
@@ -1823,6 +2733,195 @@ static i64 sys_thread_self_h(struct trap_frame *tf __unused,
     if (!td)
         return -(i64) EPERM;
     return (i64) td->id;
+}
+
+/* pthread_cancel(tid): mark the target thread cancellation-pending.
+ * Cancellation is deferred: the target observes the bit at the next
+ * cancellation point (any blocking syscall) and exits with code
+ * -ECANCELED. tid==0 is rejected (target self via testcancel).
+ */
+static i64 sys_thread_cancel_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    u16 tid = (u16) tf->a0;
+    struct proc *p = td->proc;
+
+    u64 pflags = proc_table_lock_irqsave();
+    struct sched_task *target = thread_find_by_tid_locked(p, tid);
+    bool target_live = thread_target_is_live(target);
+    if (target_live)
+        __atomic_store_n(&target->td_cancel_pending, true, __ATOMIC_RELAXED);
+    proc_table_unlock_irqrestore(pflags);
+    if (!target_live)
+        return -(i64) ESRCH;
+
+    /* Nudge a blocked target so it reaches the cancellation point promptly. */
+    sched_cancel_blocked(target);
+    return 0;
+}
+
+/* pthread_setcancelstate(state, oldstate):
+ *   state = PTHREAD_CANCEL_ENABLE / DISABLE.
+ *   a0 = new state, a1 = user *i32 to receive old state (NULL ok).
+ */
+static i64 sys_thread_setcancelstate_h(struct trap_frame *tf,
+                                       struct sched_task *td)
+{
+    if (!td)
+        return -(i64) EPERM;
+    i32 new_state = (i32) tf->a0;
+    ptr u_old = (ptr) tf->a1;
+    if (new_state != PTHREAD_CANCEL_ENABLE &&
+        new_state != PTHREAD_CANCEL_DISABLE)
+        return -(i64) EINVAL;
+
+    bool old_disabled = td->td_cancel_disabled;
+    if (u_old) {
+        i32 old_state =
+            old_disabled ? PTHREAD_CANCEL_DISABLE : PTHREAD_CANCEL_ENABLE;
+        i64 rc = copy_to_user(u_old, &old_state, sizeof(old_state));
+        if (rc < 0)
+            return rc;
+    }
+    td->td_cancel_disabled = (new_state == PTHREAD_CANCEL_DISABLE);
+    return 0;
+}
+
+/* pthread_testcancel(): if cancellation is pending and not disabled,
+ * exit the calling thread with code -ECANCELED. Otherwise return 0.
+ * Routes through sys_thread_exit_h so the lifecycle is identical to
+ * an explicit pthread_exit, including last-thread collapse to
+ * proc_exit.
+ */
+static i64 sys_thread_testcancel_h(struct trap_frame *tf, struct sched_task *td)
+{
+    if (!td)
+        return -(i64) EPERM;
+    if (thread_cancel_enabled_pending(td))
+        return cancel_thread_now(tf, td);
+    return 0;
+}
+
+/* pthread_setschedparam / pthread_getschedparam: per-target priority
+ * accessors. tid==0 means self, matching the "self" convention used
+ * by sched_setaffinity. The caller may not raise a target above its
+ * own base priority (privilege bound).
+ */
+static i64 sys_thread_setschedparam_h(struct trap_frame *tf,
+                                      struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    u16 tid = (u16) tf->a0;
+    i32 new_prio = (i32) tf->a1;
+
+    if (new_prio < SCHED_PRIO_IDLE || new_prio >= CONFIG_SCHED_NPRIO)
+        return -(i64) EINVAL;
+    if ((u8) new_prio > td->td_base_prio)
+        return -(i64) EPERM;
+
+    struct sched_task *target = td;
+    if (tid != 0 && tid != td->id) {
+        u64 pflags = proc_table_lock_irqsave();
+        target = thread_find_by_tid_locked(td->proc, tid);
+        if (target) {
+            target->td_base_prio = (u8) new_prio;
+            pi_mutex_refresh_prio(target);
+        }
+        proc_table_unlock_irqrestore(pflags);
+        if (!target)
+            return -(i64) ESRCH;
+        return 0;
+    }
+    target->td_base_prio = (u8) new_prio;
+    pi_mutex_refresh_prio(target);
+    return 0;
+}
+
+static i64 sys_thread_getschedparam_h(struct trap_frame *tf,
+                                      struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    u16 tid = (u16) tf->a0;
+    if (tid == 0 || tid == td->id)
+        return (i64) td->td_base_prio;
+
+    u64 pflags = proc_table_lock_irqsave();
+    struct sched_task *target = thread_find_by_tid_locked(td->proc, tid);
+    i64 result = target ? (i64) target->td_base_prio : -(i64) ESRCH;
+    proc_table_unlock_irqrestore(pflags);
+    return result;
+}
+
+/* sched_setscheduler / sched_getscheduler. Mazu has one effective
+ * policy (priority-based FIFO with EEVDF tiebreaker); SCHED_OTHER
+ * and SCHED_RR are accepted but treated as SCHED_FIFO. The deadline
+ * class has its own ABI (SYS_SCHED_SETATTR) and is not selectable
+ * here.
+ *
+ * a0 = pid (0 = self), a1 = policy, a2 = priority. When a1==-1 the
+ * call is a get rather than a set; the tristate keeps the syscall
+ * count flat and matches glibc's pthread thin wrappers.
+ */
+static i64 sys_sched_setscheduler_h(struct trap_frame *tf,
+                                    struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    i64 raw_pid = (i64) tf->a0;
+    i32 policy = (i32) tf->a1;
+    i32 prio = (i32) tf->a2;
+
+    if (raw_pid < 0 || raw_pid > (i64) U16_MAX)
+        return -(i64) EINVAL;
+    if (policy != SCHED_FIFO && policy != SCHED_OTHER && policy != SCHED_RR)
+        return -(i64) EINVAL;
+    if (prio < SCHED_PRIO_IDLE || prio >= CONFIG_SCHED_NPRIO)
+        return -(i64) EINVAL;
+    if ((u8) prio > td->td_base_prio)
+        return -(i64) EPERM;
+
+    /* Coerce all three policies to the single supported mapping; the
+     * policy argument is preserved purely for the matching getter.
+     */
+    u16 pid = (u16) raw_pid;
+    if (pid == 0) {
+        td->td_base_prio = (u8) prio;
+        pi_mutex_refresh_prio(td);
+        return (i64) SCHED_FIFO;
+    }
+    u64 pflags = proc_table_lock_irqsave();
+    struct proc *target_proc = proc_find_locked(pid);
+    struct sched_task *target =
+        target_proc ? proc_thread_group_leader(target_proc) : NULL;
+    if (target) {
+        target->td_base_prio = (u8) prio;
+        pi_mutex_refresh_prio(target);
+    }
+    proc_table_unlock_irqrestore(pflags);
+    if (!target)
+        return -(i64) ESRCH;
+    return (i64) SCHED_FIFO;
+}
+
+static i64 sys_sched_getscheduler_h(struct trap_frame *tf,
+                                    struct sched_task *td)
+{
+    if (!td || !td->proc)
+        return -(i64) EPERM;
+    i64 raw_pid = (i64) tf->a0;
+    if (raw_pid < 0 || raw_pid > (i64) U16_MAX)
+        return -(i64) EINVAL;
+    u16 pid = (u16) raw_pid;
+    if (pid == 0)
+        return (i64) SCHED_FIFO;
+    u64 pflags = proc_table_lock_irqsave();
+    struct proc *target_proc = proc_find_locked(pid);
+    bool found = target_proc && proc_thread_group_leader(target_proc);
+    proc_table_unlock_irqrestore(pflags);
+    return found ? (i64) SCHED_FIFO : -(i64) ESRCH;
 }
 
 /* --- Interval timers (item 15f) --- */
@@ -1842,7 +2941,15 @@ static i64 sys_timer_settime_h(struct trap_frame *tf, struct sched_task *td)
     i32 handle = (i32) tf->a0;
     u64 value_ms = tf->a1;
     u64 interval_ms = tf->a2;
-    return (i64) posix_timer_settime(handle, td->proc, value_ms, interval_ms);
+    /* a3 carries the SIGEV_THREAD_ID target. 0 means process-directed
+     * (caller did not opt into SIGEV_THREAD_ID). The kernel rejects
+     * non-zero TIDs that do not match a live thread of the owning
+     * proc up front so misconfigured timers fail at settime, not at
+     * silent expiry.
+     */
+    u16 target_tid = (u16) tf->a3;
+    return (i64) posix_timer_settime(handle, td->proc, value_ms, interval_ms,
+                                     target_tid);
 }
 
 static i64 sys_timer_delete_h(struct trap_frame *tf, struct sched_task *td)
@@ -1908,9 +3015,18 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_CLOCK_GETRES] = {sys_clock_getres, 0},
     [SYS_NANOSLEEP] = {sys_nanosleep, 0},
 
-    /* PSE51 memory locking (item 15e) */
+    /* PSE51 memory locking */
     [SYS_MLOCKALL] = {sys_mlockall, 0},
     [SYS_MUNLOCKALL] = {sys_munlockall, 0},
+    [SYS_MLOCK] = {sys_mlock, 0},
+    [SYS_MUNLOCK] = {sys_munlock, 0},
+
+    /* PSE51 synchronized I/O */
+    [SYS_FSYNC] = {sys_fsync, SYSCALL_F_NEEDS_PROC},
+    [SYS_FDATASYNC] = {sys_fdatasync, SYSCALL_F_NEEDS_PROC},
+
+    /* PSE51 single-threaded sigprocmask */
+    [SYS_SIGPROCMASK] = {sys_sigprocmask_h, SYSCALL_F_NEEDS_PROC},
 
     /* PSE51 synchronization (item 15a) */
     [SYS_MUTEX_INIT] = {sys_mutex_init_h, SYSCALL_F_NEEDS_PROC},
@@ -1969,6 +3085,20 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_THREAD_DETACH] = {sys_thread_detach_h, SYSCALL_F_NEEDS_PROC},
     [SYS_THREAD_EXIT] = {sys_thread_exit_h, SYSCALL_F_NEEDS_PROC},
     [SYS_THREAD_SELF] = {sys_thread_self_h, 0},
+    [SYS_THREAD_SETSCHEDPARAM] = {sys_thread_setschedparam_h,
+                                  SYSCALL_F_NEEDS_PROC},
+    [SYS_THREAD_GETSCHEDPARAM] = {sys_thread_getschedparam_h,
+                                  SYSCALL_F_NEEDS_PROC},
+    [SYS_SCHED_SETSCHEDULER] = {sys_sched_setscheduler_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_SCHED_GETSCHEDULER] = {sys_sched_getscheduler_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_PTHREAD_KILL] = {sys_pthread_kill_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_PTHREAD_SIGMASK] = {sys_pthread_sigmask_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_SIGSUSPEND] = {sys_sigsuspend_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_SIGTIMEDWAIT] = {sys_sigtimedwait_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_THREAD_CANCEL] = {sys_thread_cancel_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_THREAD_SETCANCELSTATE] = {sys_thread_setcancelstate_h,
+                                   SYSCALL_F_NEEDS_PROC},
+    [SYS_THREAD_TESTCANCEL] = {sys_thread_testcancel_h, SYSCALL_F_NEEDS_PROC},
 
     /* Interval timers (item 15f) */
     [SYS_TIMER_CREATE] = {sys_timer_create_h, SYSCALL_F_NEEDS_PROC},

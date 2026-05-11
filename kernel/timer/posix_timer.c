@@ -31,6 +31,32 @@ static inline bool posix_timer_owner_alive(const struct posix_timer *t)
            owner->state != PROC_STATE_ZOMBIE && owner->state != PROC_STATE_FREE;
 }
 
+static bool posix_timer_signal_pending_locked(struct proc *owner, i32 signo)
+{
+    u32 mask = sig_bit(signo);
+    u64 sflags = proc_sig_lock_irqsave(owner);
+    if ((owner->sig_state.proc_pending & mask) != 0) {
+        proc_sig_unlock_irqrestore(owner, sflags);
+        return true;
+    }
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        struct sched_task *td = owner->tasks[i];
+        if (td && (td->td_sig.pending & mask)) {
+            proc_sig_unlock_irqrestore(owner, sflags);
+            return true;
+        }
+    }
+    proc_sig_unlock_irqrestore(owner, sflags);
+    return false;
+}
+
+static bool posix_timer_target_is_live(const struct sched_task *td)
+{
+    return td && td->td_join_state != TD_JOIN_EXITED &&
+           td->td_join_state != TD_JOIN_REAPED &&
+           td->state != TD_STATE_TERMINATING;
+}
+
 static void timer_expiry_fn(void *arg)
 {
     struct posix_timer *t = arg;
@@ -38,14 +64,41 @@ static void timer_expiry_fn(void *arg)
         return;
 
     /* Deliver SIGALRM.  Validate the owner is still a live process
-     * (proc_exit sets state to ZOMBIE before clearing p->task).
+     * (proc_exit sets state to ZOMBIE before detaching its tasks).
      */
     struct proc *owner = t->owner;
     if (!posix_timer_owner_alive(t)) {
         t->armed = false;
         return;
     }
-    signal_send(owner, SIGALRM);
+    /* SIGEV_THREAD_ID: deliver to the specified thread directly. If
+     * the target thread has exited since posix_timer_settime, the
+     * signal is silently dropped: a thread-directed signal must not
+     * spray onto sibling threads that did not opt in.
+     */
+    if (t->target_tid != 0) {
+        u64 tflags = proc_table_lock_irqsave();
+        struct sched_task *target = NULL;
+        for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+            struct sched_task *td = owner->tasks[i];
+            if (td && td->id == t->target_tid &&
+                posix_timer_target_is_live(td)) {
+                target = td;
+                break;
+            }
+        }
+        if (target) {
+            u64 sflags = proc_sig_lock_irqsave(owner);
+            __atomic_or_fetch(&target->td_sig.pending, sig_bit(SIGALRM),
+                              __ATOMIC_RELAXED);
+            proc_sig_unlock_irqrestore(owner, sflags);
+            if (target->state == TD_STATE_SLEEPING)
+                sched_wake_sleeping(target);
+        }
+        proc_table_unlock_irqrestore(tflags);
+    } else {
+        signal_send(owner, SIGALRM);
+    }
 
     if (t->interval_ticks > 0) {
         /* Periodic: re-arm only if still armed.  posix_timer_delete
@@ -55,10 +108,17 @@ static void timer_expiry_fn(void *arg)
         if (!t->armed)
             return;
         /* POSIX overrun: count expirations that occur while the previous
-         * SIGALRM is still pending (not yet delivered/handled).
+         * SIGALRM is still pending (not yet delivered/handled) on any
+         * thread in the group.
          */
-        if (owner->sig_state.pending & (1U << SIGALRM))
-            t->overrun++;
+        {
+            u64 tflags = proc_table_lock_irqsave();
+            bool alrm_pending =
+                posix_timer_signal_pending_locked(owner, SIGALRM);
+            proc_table_unlock_irqrestore(tflags);
+            if (alrm_pending)
+                t->overrun++;
+        }
         callout_set_ticks(&t->co, t->interval_ticks, timer_expiry_fn, t);
     } else {
         t->armed = false;
@@ -91,7 +151,8 @@ i32 posix_timer_create(struct proc *p)
 i32 posix_timer_settime(i32 handle,
                         struct proc *caller,
                         u64 value_ms,
-                        u64 interval_ms)
+                        u64 interval_ms,
+                        u16 target_tid)
 {
     if (handle < 0 || handle >= POSIX_TIMER_MAX)
         return -(i32) EINVAL;
@@ -102,10 +163,31 @@ i32 posix_timer_settime(i32 handle,
     if (!posix_timer_owner_matches(t, caller))
         return -(i32) EPERM;
 
+    /* If a specific TID is requested, validate it is currently a live
+     * thread of the owning proc; reject up front so user space cannot
+     * set up a timer that silently fails to deliver later.
+     */
+    if (target_tid != 0) {
+        u64 tflags = proc_table_lock_irqsave();
+        bool found = false;
+        for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+            struct sched_task *td = caller->tasks[i];
+            if (td && td->id == target_tid && posix_timer_target_is_live(td)) {
+                found = true;
+                break;
+            }
+        }
+        proc_table_unlock_irqrestore(tflags);
+        if (!found)
+            return -(i32) ESRCH;
+    }
+
     /* Disarm any existing timer before reconfiguration.  Use synchronous
      * cancel so an in-flight expiry callback cannot race with the new state.
      */
     callout_cancel_sync(&t->co);
+
+    t->target_tid = target_tid;
 
     /* POSIX: value_ms == 0 means disarm the timer. */
     if (value_ms == 0) {

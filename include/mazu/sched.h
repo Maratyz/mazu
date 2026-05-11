@@ -20,6 +20,7 @@
 #include <mazu/stringdef.h>
 #include <mazu/time.h>
 #include <mazu/tls.h>
+#include <mazu/waitqueue.h>
 
 /* Direct defconfig copies may omit implicit Kconfig defaults.
  * Keep scheduler buildable by providing the canonical defaults here.
@@ -178,9 +179,7 @@ struct sched_task {
 
     sched_callback_func_t callback;
     void *context;
-    bool must_not_exit; /* if true, returning from callback triggers a kernel
-                           panic
- */
+    bool must_not_exit; /* if true, returning from callback triggers panic */
 
     struct proc *proc; /* owning user process, or NULL for kernel tasks */
     struct sched_domain *domain; /* CPU budget domain, or NULL (unlimited) */
@@ -217,13 +216,12 @@ struct sched_task {
 #endif
 
     u64 last_activity_ms; /* timestamp of last observable activity
-                             (yield/rx/http)
- */
+                           * (yield/rx/http)
+                           */
     bool hung; /* set by watchdog when task exceeds inactivity timeout */
-    bool td_cleanup_queued; /* once set, this task is already staged for
-                               deferred destruction and must not be queued
-                               again
- */
+    bool td_cleanup_queued; /* once set, task is already staged for deferred
+                             * destruction and must not be queued again
+                             */
     sched_block_cleanup_fn_t td_block_cleanup;
     void *td_block_cleanup_ctx;
 
@@ -231,14 +229,95 @@ struct sched_task {
      * Indexed by enum tls_entry.  Zeroed on task creation.
      */
     uptr tls[MAX_TLS_ENTRY];
+
+    /* Per-thread signal state. POSIX requires the blocked mask to be per-thread
+     * (pthread_sigmask). The signal-frame trampoline state is also per-thread
+     * because each thread runs handlers on its own user stack, so process-wide
+     * chain would corrupt with concurrent delivery once threads become real
+     * (PROC_THREAD_MAX > 1). The pending mask is per-thread to give the future
+     * thread-directed signal path (pthread_kill, SIGEV_THREAD_ID) somewhere to
+     * deposit its bit; today, signal_send walks tasks[] and ORs into elected
+     * thread's td_sig.pending.
+     *
+     * Lifetime: zeroed on task creation. Read/written under proc->sig_lock (the
+     * lock scope stays per-proc; the data lives per-task).
+     */
+    struct {
+        u32 pending;
+        u32 blocked;
+        ptr frame_top;
+        ptr frame_prev;
+        u32 frame_cookie;
+        u32 frame_prev_cookie;
+        /* Signal mask to restore on return-to-user after sigsuspend.
+         * sys_sigsuspend_h captures the prior blocked mask here and
+         * sets sigsuspend_active = true; signal_deliver / SIG_IGN
+         * dequeue consult these to wire the original mask into the
+         * signal frame so sigreturn restores it instead of the
+         * temporary suspend mask.
+         */
+        u32 sigsuspend_saved_blocked;
+        bool sigsuspend_active;
+        /* Signal set this thread is parked on in sigtimedwait.
+         * signal_send-style writers check it before nudging the
+         * thread, so a sleeping sigtimedwait thread is woken only
+         * by a signal that matches its set (eliminating spurious
+         * wakeups).  0 means the thread is not in sigtimedwait.
+         */
+        u32 sigwait_set;
+    } td_sig;
+
+    /* Per-thread robust futex list. Linux semantics: the kernel walks this on
+     * thread exit to unlock orphaned futexes that the dying thread held. Lives
+     * per-task because each thread holds its own locks; today there is one
+     * thread per process so behavior matches the previous per-process layout
+     * exactly.
+     */
+    ptr td_robust_list_head;
+    i32 td_robust_futex_offset;
+    ptr td_robust_pending;
+
+    /* PSE51 thread lifecycle (pthread_create / _join / _detach / _exit).
+     * td_join_state runs FREE -> JOINABLE -> EXITED -> REAPED, or FREE ->
+     * JOINABLE -> DETACHED -> auto-reaped after exit.
+     * td_exit_code is populated by SYS_THREAD_EXIT or the implicit return path;
+     * readers wait on td_join_wq for a JOINABLE thread to reach EXITED. State
+     * transitions use atomic operations; task-list membership changes are
+     * serialized separately under proc_table_lock.
+     *
+     * Embedded waitqueue (rather than allocated) keeps thread join inside the
+     * bounded RTOS budget: no heap on the create or join hot paths.
+     */
+    enum {
+        TD_JOIN_FREE = 0, /* slot is free; never been a user thread */
+        TD_JOIN_JOINABLE, /* live, joinable */
+        TD_JOIN_DETACHED, /* live, detached (no one will join) */
+        TD_JOIN_EXITED,   /* exit value populated, waiting for join */
+        TD_JOIN_REAPED,   /* joined or auto-reaped; resources released */
+    } td_join_state;
+    i32 td_exit_code;
+    struct wait_queue_head td_join_wq;
+    bool td_exit_started;
+
+    /* PSE51 cancellation state (pthread_cancel / _setcancelstate /
+     * _setcanceltype / _testcancel).  td_cancel_pending is set by
+     * pthread_cancel and consumed at the next cancellation point.
+     * td_cancel_disabled disables cancellation entirely.  ASYNC type
+     * is treated as DEFERRED here because Mazu has no in-kernel
+     * cancellation points other than blocking syscalls (which check
+     * the flag on entry); ASYNC interruption inside arbitrary user
+     * code would require user-space libc cooperation that the
+     * kernel layer cannot provide on its own.
+     */
+    bool td_cancel_pending;
+    bool td_cancel_disabled;
 };
 
 /* Initialize the scheduling subsystem.
- * The current flow becomes task 0 and is inserted as the bootstrap
- * idle-priority thread for the boot hart. After initialization, all runnable
- * work is selected by the scheduler and preempted by the timer path; callers do
- * not need to cooperate beyond using the blocking APIs that change task state
- * explicitly.
+ * The current flow becomes task 0 and is inserted as bootstrap idle-priority
+ * thread for the boot hart. After initialization, all runnable work is selected
+ * by the scheduler and preempted by the timer path; callers do not need to
+ * cooperate beyond using the blocking APIs that change task state explicitly.
  */
 void sched_init(void);
 
@@ -264,10 +343,30 @@ struct result sched_create_task_noreturn_prio(sched_callback_func_t callback,
                                               u8 prio);
 
 /* Create a user-mode task. The task will sret into U-mode at 'entry' with
- * sp = USER_STACK_TOP. 'p' is the owning process (must already have its
- * code pages mapped). The user stack pages are mapped by this function.
+ * sp = USER_STACK_TOP. 'p' is the owning process (must already have its code
+ * pages mapped). The user stack pages are mapped by this function.
  */
 struct result sched_create_user_task(struct proc *p, ptr entry, u8 prio);
+
+/* Create an additional user thread inside an existing process for
+ * pthread_create. The caller passes the user-mode entry point and a single
+ * argument (the POSIX pthread_create arg, placed in a0 on first dispatch).
+ * Returns 0 on success and writes the new task pointer to *out_td; returns
+ * a negative errno on failure (in which case *out_td is unchanged).
+ */
+i32 sched_create_user_thread(struct proc *p,
+                             ptr u_entry,
+                             ptr u_arg,
+                             u8 prio,
+                             u32 inherited_sigmask,
+                             struct sched_task **out_td);
+
+/* Free a user thread that exited in JOINABLE state and has now been
+ * reaped via SYS_THREAD_JOIN. The caller must have transitioned
+ * td_join_state from EXITED to REAPED under proc_sig_lock so no other
+ * thread can race the free.
+ */
+void sched_reap_user_thread(struct sched_task *dead);
 
 /* Return the ID of the task that is currently running.
  * Before sched_init(), returns 0 so early boot and post-init task 0 share the
@@ -387,6 +486,12 @@ void sched_wake_ready(struct sched_task *task);
  */
 void sched_wake_sleeping(struct sched_task *td);
 
+/* Wake a task blocked in a cancellation point.
+ * If the task has stack-backed wait state, run its registered cleanup hook
+ * first so it is safely unlinked before being re-enqueued.
+ */
+void sched_cancel_blocked(struct sched_task *task);
+
 /* Register or clear a deferred cleanup hook for stack-backed blocking state.
  * The hook runs before the task stack is freed.
  */
@@ -456,8 +561,9 @@ struct sched_domain_stats {
 #define SCHED_DOMAIN_SYS 1
 #define SCHED_DOMAIN_COUNT 2
 
-/* Snapshot a named domain's state.  Returns 0 on success, -1 if
- * domain_id is out of range or domains are not initialized.
+/* Snapshot a named domain's state.
+ * Returns 0 on success, -1 if domain_id is out of range or domains are not
+ * initialized.
  */
 int sched_domain_get_stats(u32 domain_id, struct sched_domain_stats *out);
 

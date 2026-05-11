@@ -7,16 +7,6 @@
 <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
-
-<nav class="sidebar">
-  <div class="sidebar-title">Mazu OS</div>
-  <a href="/dashboard.html">Dashboard</a>
-  <a href="/files.html">Files</a>
-  <a href="/network.html">Network</a>
-  <a href="/telemetry.html">Telemetry</a>
-  <a href="/shell.html">Shell</a>
-</nav>
-
 <div class="main">
   <div class="page-header">
     <div class="status-dot connecting" id="dot"></div>
@@ -69,50 +59,6 @@
 </div>
 
 <script src="/js/common.js"></script>
-<script>
-'use strict';
-
-var dot = document.getElementById('dot');
-
-function refresh() {
-    fetchJSON('/api/stats').then(function (d) {
-        dot.className = 'status-dot';
-        document.getElementById('val-uptime').textContent = formatDuration(d.uptime_ms);
-        document.getElementById('uptime').textContent = formatDuration(d.uptime_ms);
-
-        var mem = d.memory;
-        var used = mem.total_pages - mem.free_pages;
-        var pct = mem.total_pages ? Math.round(100 * used / mem.total_pages) : 0;
-        document.getElementById('val-mem').textContent = pct + '%';
-        document.getElementById('val-mem-detail').textContent =
-            used + ' / ' + mem.total_pages + ' pages';
-        var gf = document.getElementById('mem-gauge');
-        gf.style.width = pct + '%';
-        gf.className = 'gauge-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warn' : '');
-
-        var tcp = d.tcp;
-        document.getElementById('val-tcp').textContent = tcp.connections;
-        document.getElementById('val-tcp-detail').textContent =
-            'retx: ' + tcp.retransmits;
-        document.getElementById('val-4xx').textContent = d.http['4xx'];
-        document.getElementById('val-5xx').textContent = d.http['5xx'];
-        document.getElementById('val-tx').textContent = formatBytes(tcp.bytes_tx);
-        document.getElementById('val-rx').textContent = formatBytes(tcp.bytes_rx);
-
-        var tb = document.getElementById('task-body');
-        tb.innerHTML = '';
-        d.tasks.forEach(function (t) {
-            var tr = document.createElement('tr');
-            tr.innerHTML = '<td>' + t.id + '</td><td>' + t.state +
-                '</td><td>' + t.prio + '</td><td>' + t.cpu_us + ' us</td>';
-            tb.appendChild(tr);
-        });
-    }).catch(function () {
-        dot.className = 'status-dot offline';
-    });
-}
-
-createPoller(refresh, 2000).start();
-</script>
+<script src="/js/dashboard.js"></script>
 </body>
 </html>

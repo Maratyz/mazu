@@ -2,8 +2,8 @@
 /* User-space process management.
  *
  * Each process owns a set of user-mapped pages, a file descriptor table,
- * and a reference to its scheduler task.  The process table is a small
- * static array (PROC_MAX entries).
+ * and a bounded thread group. The process table is a small static array
+ * (PROC_MAX entries).
  */
 
 #ifndef MAZU_PROC_H
@@ -13,6 +13,10 @@
 #include <mazu/byte.h>
 #include <mazu/error.h>
 #include <mazu/paging.h>
+#include <mazu/spinlock.h>
+#include <mazu/uaccess.h>
+#include <mazu/vfs.h>
+#include <mazu/waitqueue.h>
 
 /* PSE51 signal state.  31 signals (1-31) in a 32-bit bitmask. */
 #define SIG_MAX 32
@@ -22,23 +26,32 @@ struct sigaction_entry {
     u32 sa_mask;
     u32 sa_flags;
 };
+
+/* Per-process signal state. The blocked mask and signal-frame chain live
+ * per-thread (struct sched_task::td_sig); the disposition table stays
+ * per-process per POSIX. proc_pending holds process-directed signals that have
+ * not yet been claimed by any specific thread; the return-to-user delivery
+ * path folds it into each thread's local pending view, preserving the bit even
+ * if the thread that the sender first observed has since exited.
+ */
 struct signal_state {
-    u32 pending;
-    u32 blocked;
-    ptr frame_top;
-    ptr frame_prev;
-    u32 frame_cookie;
-    u32 frame_prev_cookie;
     struct sigaction_entry actions[SIG_MAX];
+    u32 proc_pending;
 };
-#include <mazu/spinlock.h>
-#include <mazu/uaccess.h>
-#include <mazu/vfs.h>
 
 #define PROC_MAX 16
 #define PROC_FD_MAX 32
 #define PROC_PAGES_MAX 32
 #define PROC_VMA_MAX 8
+
+/* Maximum live tasks (threads) per process. The per-thread state migration
+ * (sigmask / signal-frame chain / robust futex / errno TLS) has landed, so
+ * PROC_THREAD_MAX > 1 is now safe.  Bumping this number costs
+ * PROC_THREAD_MAX * (USER_STACK_SIZE + PAGE_SIZE) of user VA inside the
+ * per-process slot, plus PROC_THREAD_MAX pointers in struct proc::tasks[]; both
+ * are bounded.
+ */
+#define PROC_THREAD_MAX 4
 #define PROC_FD_STDIN 0
 #define PROC_FD_STDOUT 1
 #define PROC_FD_STDERR 2
@@ -57,9 +70,9 @@ struct signal_state {
 #define VMA_PERM_WRITE BIT(1)
 #define VMA_PERM_EXEC BIT(3)
 
-/* Virtual Memory Area: describes a contiguous user-space region with
- * uniform permissions.  Used for user-pointer validation and W^X
- * enforcement.  Populated during task creation (code + stack VMAs).
+/* Virtual Memory Area: describes a contiguous user-space region with uniform
+ * permissions.  Used for user-pointer validation and W^X enforcement. Populated
+ * during task creation (code + stack VMAs).
  */
 struct vma {
     vaddr_t base;
@@ -84,24 +97,31 @@ struct proc_fd {
     bool is_dup;        /* true if created via dup/dup2; skip vfs_close */
     bool is_seekable;   /* false for console/pipe; true for regular files */
     bool is_pipe;       /* true if this FD is a pipe end */
-    bool pipe_read_end; /* true = read end, false = write end (only if is_pipe)
-                         */
+    bool pipe_read_end; /* true: read, false: write (only if is_pipe) */
     sz offset;          /* current file position (used by read/write/lseek) */
     struct vfs_file file;
     struct pipe *pipe; /* non-NULL if is_pipe */
 };
 
-/* Per-process VA slot size: divide user address space equally among
- * PROC_MAX processes.  Each slot contains code, data, and stack.
- * Slot i occupies [USER_CODE_BASE + i*PROC_SLOT_SIZE,
- *                  USER_CODE_BASE + (i+1)*PROC_SLOT_SIZE).
+/* Per-process VA slot size: divide user address space equally among PROC_MAX
+ * processes. Each slot contains code, data, and stack. Slot i occupies
+ * [USER_CODE_BASE + i*PROC_SLOT_SIZE, USER_CODE_BASE + (i+1)*PROC_SLOT_SIZE).
  */
 #define PROC_SLOT_SIZE \
     (((0x40000000UL - 0x00010000UL) / PROC_MAX) & ~(0x1000UL - 1))
 
 struct proc {
     u64 watchdog_heartbeat_ms;
-    struct sched_task *task;
+    /* Bounded per-process task list. Slots are stable because each slot owns
+     * a fixed user-stack VA band. All readers and writers must hold
+     * proc_table_lock; there is no lock-free walk path today.
+     */
+    struct sched_task *tasks[PROC_THREAD_MAX];
+    u8 n_tasks;
+    u8 leader_idx;          /* slot of the elected thread-group leader. */
+    u8 reserved_task_slots; /* bitmask of in-flight slot reservations. */
+    u64 exited_cpu_time_us; /* CPU time retained from reaped worker threads. */
+    struct wait_queue_head thread_event_wq; /* stable wake source for joins */
 
     /* Per-process VA window (set during proc_alloc based on PID slot). */
     vaddr_t va_code_base; /* start of code region */
@@ -121,6 +141,13 @@ struct proc {
     u8 vma_cache_read;
     u8 vma_cache_write;
     enum proc_state state;
+    /* Single-shot guard for proc_exit so a race between sys_exit and a
+     * SIGKILL-driven exit on the same proc cannot double-execute the
+     * teardown (futex_exit_robust_list, posix_timer_teardown_proc,
+     * sync_handle_teardown_proc).  Set under proc_table_lock; cleared
+     * implicitly by proc_alloc's memset on slot reuse.
+     */
+    bool is_exiting;
     i32 exit_code;
     /* Per-process syscall whitelist.  0 = unrestricted.
      * Two u64 words cover syscall numbers 0..127.
@@ -130,18 +157,10 @@ struct proc {
     spinlock_t sig_lock;
     struct signal_state sig_state;
 
-    /* Robust futex list: user-space pointer to a linked list of futex
-     * addresses that the kernel walks on process exit to unlock orphaned
-     * futexes.  Set via SYS_SET_ROBUST_LIST.  0 = not registered.
-     *
-     * Layout mirrors Linux: each list entry is a user pointer to the next
-     * entry.  The futex word to unlock lives at robust_futex_offset bytes
-     * from the entry pointer.  robust_pending is an entry currently being
-     * locked (not yet added to the list).
+    /* Robust futex list moved per-thread (struct sched_task::
+     * td_robust_list_head / _futex_offset / _pending) so each thread unwinds
+     * its own held futexes on exit, matching Linux semantics.
      */
-    ptr robust_list_head;    /* user pointer to first entry (or self = empty) */
-    i32 robust_futex_offset; /* byte offset from entry to futex word */
-    ptr robust_pending;      /* entry being locked (may not be in list yet) */
 
     u16 pid;
     u16 parent_pid;
@@ -173,6 +192,50 @@ static inline struct str proc_state_name(enum proc_state s)
         return STR("???");
     }
 }
+
+/* Return the thread-group leader, or NULL if the proc has no live threads
+ * (post-detach during proc_exit). Cheap inline accessor. Callers that need the
+ * leader to remain valid across a sleep must hold proc_table_lock for the
+ * duration of the dereference, same as the previous direct read of p->task.
+ */
+static inline struct sched_task *proc_thread_group_leader(struct proc *p)
+{
+    if (!p || p->n_tasks == 0)
+        return NULL;
+    if (p->leader_idx >= PROC_THREAD_MAX)
+        return NULL;
+    return p->tasks[p->leader_idx];
+}
+
+/* Return the index of the given live task inside p->tasks[], or
+ * PROC_THREAD_MAX if the task is not attached.
+ */
+static inline u8 proc_task_slot(struct proc *p, const struct sched_task *td)
+{
+    if (!p || !td)
+        return PROC_THREAD_MAX;
+    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
+        if (p->tasks[i] == td)
+            return i;
+    }
+    return PROC_THREAD_MAX;
+}
+
+/* Attach a task to the process. Returns false if the task list is full (today:
+ * if a task is already attached). Caller must hold proc_table_lock.
+ */
+bool proc_attach_task(struct proc *p, struct sched_task *td);
+bool proc_attach_task_slot(struct proc *p, struct sched_task *td, u8 slot);
+bool proc_reserve_thread_slot(struct proc *p, u8 *out_slot);
+void proc_release_thread_slot(struct proc *p, u8 slot);
+void proc_release_thread_stack(struct proc *p, u8 slot);
+void proc_reap_exited_thread_locked(struct proc *p, struct sched_task *td);
+void proc_reap_exited_thread(struct proc *p, struct sched_task *td);
+
+/* Detach the given task from the process. The task's ->proc field is cleared.
+ * Caller must hold proc_table_lock.
+ */
+void proc_detach_task(struct proc *p, struct sched_task *td);
 
 /* Initialize the process table.  Called once during boot. */
 void proc_init(void);
@@ -209,12 +272,14 @@ void proc_for_each(proc_iter_cb_t cb, void *ctx);
 __must_check struct result proc_map_user_page(struct proc *p,
                                               vaddr_t vaddr,
                                               u16 perms);
+bool proc_unmap_user_page(struct proc *p, vaddr_t vaddr);
 
 /* Unmap and free all user pages belonging to the process. */
 void proc_free_user_pages(struct proc *p);
 
 /* Register a VMA in the process.  Returns 0 on success, -ENOMEM if full. */
 __must_check i32 proc_add_vma(struct proc *p, vaddr_t base, sz len, u16 perms);
+bool proc_remove_vma(struct proc *p, vaddr_t base, sz len);
 
 /* Check whether [addr, addr+len) falls entirely within a registered VMA. */
 bool proc_vma_contains(struct proc *p, ptr addr, sz len);
@@ -233,8 +298,8 @@ bool proc_vma_check_access(struct proc *p,
 void proc_set_state(struct proc *p, enum proc_state new_state);
 
 /* Block the calling task until a child of 'parent' enters ZOMBIE state.
- * On success, *out_pid receives the child's PID and *out_code receives
- * the child's exit code.  The zombie is reaped (transitioned to FREE).
+ * On success, *out_pid receives the child's PID and *out_code receives the
+ * child's exit code.  The zombie is reaped (transitioned to FREE).
  * Returns 0 on success, -ECHILD if the process has no children.
  */
 i32 proc_wait_child(struct proc *parent, u16 *out_pid, i32 *out_code);
@@ -253,14 +318,14 @@ __must_check struct result proc_load_elf(struct proc *p,
 /* Return true if pid is absent from the process table or already ZOMBIE. */
 bool proc_is_missing_or_zombie(u16 pid);
 
-/* Reparent all live children of 'parent' to PID 1 (init).  If PID 1 is
- * missing, zombie children are auto-reaped.  Must be called before the
- * parent transitions to ZOMBIE.  Acquires proc_table_lock internally.
+/* Reparent all live children of 'parent' to PID 1 (init). If PID 1 is missing,
+ * zombie children are auto-reaped.  Must be called before the parent
+ * transitions to ZOMBIE. Acquires proc_table_lock internally.
  */
 void proc_reparent_children(struct proc *parent);
 
-/* Full process exit: reparent children, transition to ZOMBIE, notify
- * parent or auto-reap if orphaned.  Returns the exit code.
+/* Full process exit: reparent children, transition to ZOMBIE, notify parent or
+ * auto-reap if orphaned.  Idempotent: a second concurrent caller is a no-op.
  */
 void proc_exit(struct proc *p, i32 exit_code);
 

@@ -87,21 +87,24 @@ DEFINE_SELFTEST(cpu_time, test_cpu_time);
 /* Priority ordering: create tasks at different priorities, verify execution
  * order via a shared counter array.  Higher priority runs first.
  */
-static volatile int prio_order[3];
+#define PRIO_ORDER_N 3
+static volatile int prio_order[PRIO_ORDER_N];
 static volatile int prio_idx;
+static volatile int prio_done_count;
 
 static void selftest_prio_cb(void *ctx)
 {
     int slot = (int) (uptr) ctx;
-    int idx = prio_idx;
+    int idx = __atomic_fetch_add(&prio_idx, 1, __ATOMIC_ACQ_REL);
     if (idx < (int) countof(prio_order))
         prio_order[idx] = slot;
-    prio_idx = idx + 1;
+    __atomic_fetch_add(&prio_done_count, 1, __ATOMIC_RELEASE);
 }
 
 static i32 test_priority_order(void)
 {
-    prio_idx = 0;
+    __atomic_store_n(&prio_idx, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&prio_done_count, 0, __ATOMIC_RELAXED);
     prio_order[0] = prio_order[1] = prio_order[2] = -1;
 
     /* Create tasks: LOW=0, NORMAL=1, HIGH=2. Create in ascending order
@@ -136,16 +139,19 @@ static i32 test_priority_order(void)
     }
     enable_interrupts();
 
-    /* Yield to let them all run.  The main task is IDLE priority, so all
-     * created tasks will run before resuming.  Any pending IPI that
-     * arrived during the disabled window fires now, triggering the
-     * context switch to the highest-priority test task.
-     *
-     * Use a brief sleep (not yield) to give all three tasks time to
-     * complete on SMP, where timer ticks and IPI processing may delay
-     * the pinned tasks beyond a single yield quantum.
+    /* Poll for all three tasks to complete, yielding between checks.
+     * The main task is IDLE priority, so each yield cycles through the BSP idle
+     * thread and any pending IDLE-priority test task before resuming. Yielding
+     * (sleep_ms(0)) avoids the long-sleep wake path that has shown intermittent
+     * stalls under QEMU TCG SMP timing.
      */
-    sleep_ms(time_ms_new(50));
+    u64 start = time_rdtime();
+    u64 timeout = time_ms_to_ticks(2000);
+    while (__atomic_load_n(&prio_done_count, __ATOMIC_ACQUIRE) < PRIO_ORDER_N) {
+        if (time_rdtime() - start > timeout)
+            return 1;
+        sleep_ms(time_ms_new(0));
+    }
 
     /* Expected order: HIGH(2), NORMAL(1), IDLE(0). */
     if (prio_order[0] != 2 || prio_order[1] != 1 || prio_order[2] != 0)

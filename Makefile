@@ -286,8 +286,8 @@ run: $(CHECK_DEPS)
 
 CHECK_PID     := $(BUILD_DIR)/check_qemu.pid
 CHECK_LOG     := $(BUILD_DIR)/check_serial.log
-CHECK_TIMEOUT := 30
-CHECK_SELFTEST_TIMEOUT := 120
+CHECK_TIMEOUT ?= 30
+CHECK_SELFTEST_TIMEOUT ?= 120
 CHECK_SELFTEST_PID := $(BUILD_DIR)/check_selftest_qemu.pid
 CHECK_SELFTEST_LOG := $(BUILD_DIR)/check_selftest_serial.log
 

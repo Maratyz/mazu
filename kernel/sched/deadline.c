@@ -124,9 +124,28 @@ static void dl_replenish_cb(void *arg)
      * the original wake path handles re-enqueueing; the throttle flag
      * is already cleared above so the task won't be re-throttled on
      * the next enqueue.
+     *
+     * READY is a third case: the task is already sitting in
+     * pcpu_dl_runq[cpu] but sched_dl_pick_next was skipping it because
+     * dl_throttled was set.  Now that we cleared the flag the task is
+     * pickable, but the owning hart has not been notified -- if it is
+     * the per-hart idle thread in wfi (pcpu_runq_bitmap == 0, only DL
+     * entries on the runq), it will stay there until something else
+     * pokes it.  Force a reschedule on its CPU.
      */
-    if (task->state == TD_STATE_DL_THROTTLED)
+    if (task->state == TD_STATE_DL_THROTTLED) {
         sched_wake_ready(task);
+    } else if (task->state == TD_STATE_READY) {
+        u32 cpu = task->td_last_cpu;
+        if (cpu < MAX_CPUS) {
+            struct pcpu *tpc = &pcpu_array[cpu];
+            __atomic_store_n(&tpc->need_resched, 1, __ATOMIC_RELEASE);
+#if CONFIG_SMP
+            if (cpu != get_cpuid())
+                ipi_send(cpu, IPI_SCHED);
+#endif
+        }
+    }
 }
 
 /* Admission check: can (runtime_ticks, period_ticks) be added without

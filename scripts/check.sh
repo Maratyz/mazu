@@ -701,6 +701,65 @@ test_keepalive() {
     if $all_ok; then
         pass
     else fail "sequential GETs" "codes: $codes"; fi
+
+    local concurrent_ok
+    concurrent_ok=$(BASE_URL="$BASE_URL" python3 -c '
+import os, socket, sys
+from urllib.parse import urlparse
+
+url = urlparse(os.environ["BASE_URL"])
+host = url.hostname or "127.0.0.1"
+port = url.port or 80
+held = []
+
+def read_response(sock):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("short header")
+        data += chunk
+    head, body = data.split(b"\r\n\r\n", 1)
+    headers = head.decode("latin-1", errors="replace").split("\r\n")
+    status = headers[0]
+    clen = 0
+    for line in headers[1:]:
+        if line.lower().startswith("content-length:"):
+            clen = int(line.split(":", 1)[1].strip())
+            break
+    while len(body) < clen:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("short body")
+        body += chunk
+    return status
+
+try:
+    for _ in range(16):
+        s = socket.create_connection((host, port), timeout=5)
+        s.settimeout(5)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        status = read_response(s)
+        if "200" not in status:
+            raise RuntimeError("held status=" + status)
+        held.append(s)
+
+    probe = socket.create_connection((host, port), timeout=5)
+    probe.settimeout(5)
+    probe.sendall(b"GET /network.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    status = read_response(probe)
+    probe.close()
+    print("ok" if "200" in status else status)
+finally:
+    for s in held:
+        try:
+            s.close()
+        except OSError:
+            pass
+') || true
+    if [ "$concurrent_ok" = "ok" ]; then
+        pass
+    else fail "17th concurrent browser socket" "got ${concurrent_ok:-failure}"; fi
     section_end
 }
 
@@ -1200,13 +1259,32 @@ test_web_ui() {
     check_url "GET /files.html" "$BASE_URL/files.html" 200 "File Browser"
     check_url "GET /network.html" "$BASE_URL/network.html" 200 "Network"
     check_url "GET /telemetry.html" "$BASE_URL/telemetry.html" 200 "Telemetry"
+    check_url "GET /shell.html" "$BASE_URL/shell.html" 200 "Shell"
 
     # Static assets referenced by pages
     check_status "GET /css/style.css" "$BASE_URL/css/style.css" 200
     check_status "GET /js/common.js" "$BASE_URL/js/common.js" 200
+    check_status "GET /js/dashboard.js" "$BASE_URL/js/dashboard.js" 200
+    check_status "GET /js/files.js" "$BASE_URL/js/files.js" 200
+    check_status "GET /js/network.js" "$BASE_URL/js/network.js" 200
+    check_status "GET /js/telemetry.js" "$BASE_URL/js/telemetry.js" 200
+    check_status "GET /js/shell.js" "$BASE_URL/js/shell.js" 200
 
     # Dashboard JSON endpoint (polled by dashboard.html)
     check_body_contains "dashboard stats" "$BASE_URL/api/stats" '"uptime_ms"'
+
+    # Regressor flow: browse files, open text files, visit network, then keep
+    # navigating to other pages. This mirrors the reported browser sequence.
+    check_body_contains "root file listing" "$BASE_URL/api/fs?path=/" '"config.txt"'
+    check_body_contains "root file listing hello" "$BASE_URL/api/fs?path=/" '"hello.txt"'
+    check_body_contains "read /config.txt" \
+        "$BASE_URL/api/fs/read?path=/config.txt" "host_ip=192.168.100.2"
+    check_body_contains "read /hello.txt" \
+        "$BASE_URL/api/fs/read?path=/hello.txt" "Hello friend! Welcome to fun"
+    check_body_contains "network tcp table" "$BASE_URL/api/tcp" '"connections"'
+    check_body_contains "network arp table" "$BASE_URL/api/arp" '"entries"'
+    check_url "navigate back to dashboard" "$BASE_URL/dashboard.html" 200 "Dashboard"
+    check_url "navigate onward to telemetry" "$BASE_URL/telemetry.html" 200 "Telemetry"
 
     section_end
 }

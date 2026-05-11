@@ -46,15 +46,21 @@ static sz global_tcp_stats_pool_exhaustion;
 static sz global_tcp_stats_n_connections;
 
 /* SYN flood guard: max half-open (SYN_RCVD) connections from a single peer IP.
+ * A real browser opening multiple tabs to the same origin can have several
+ * SYNs in flight simultaneously; the cap must accommodate that while still
+ * bounding the half-open queue.
  */
-#define TCP_MAX_SYN_RCVD_PER_IP 4
+#define TCP_MAX_SYN_RCVD_PER_IP 16
 
 /* Per-source-IP connection limit: max simultaneous half-open + established
  * connections from any single peer IP. Protects the fixed-size connection pool
- * from a single client exhausting all slots. Rejected with RST so the client
- * gets immediate feedback (rather than a silent drop).
+ * from a single client exhausting all slots.
+ *
+ * Keep this above the web server's WEB_MAX_CONNS so a browser can establish
+ * one more socket and give the HTTP layer a chance to evict an older idle
+ * keep-alive connection rather than being reset in TCP first.
  */
-#define TCP_MAX_CONNS_PER_IP 8
+#define TCP_MAX_CONNS_PER_IP 32
 
 /* Hash-based connection demux. 256 buckets, Jenkins one-at-a-time hash seeded
  * at boot from rdtime low bits. Exact-match lookup is O(1) amortized; wildcard/
@@ -962,6 +968,23 @@ static struct tcp_conn *tcp_lookup_conn(struct ipv4_addr host_addr,
     struct tcp_conn *conn;
     list_for_each_entry_safe (&tcp_hash_table[bucket], conn, struct tcp_conn,
                               hash_node) {
+        if (ipv4_addr_is_equal(host_addr, conn->host_addr) &&
+            host_port == conn->host_port &&
+            ipv4_addr_is_equal(peer_addr, conn->peer_addr) &&
+            peer_port == conn->peer_port)
+            return conn;
+    }
+
+    /* Robustness fallback: if the hashed exact lookup misses, do a linear
+     * exact-match scan before falling back to wildcard/listen sockets.
+     * This preserves correct demux for established and half-open sockets even
+     * if a hash link was lost during teardown or slot reuse.
+     */
+    for (sz i = 0; i < TCP_CONN_MAX_NUM; i++) {
+        conn = &global_tcp_conn_table[i];
+        if (!conn->is_used)
+            continue;
+
         if (ipv4_addr_is_equal(host_addr, conn->host_addr) &&
             host_port == conn->host_port &&
             ipv4_addr_is_equal(peer_addr, conn->peer_addr) &&

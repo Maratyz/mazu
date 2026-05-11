@@ -33,15 +33,23 @@
  * WEB_SHELL_POST_BODY_MAX   4096    413 Request Entity Too Large
  * WEB_REQUEST_TIMEOUT_MS    5000    400 Bad Request (header/body timeout)
  * WEB_KEEPALIVE_TIMEOUT_MS  30000   silent close (idle keep-alive)
- * WEB_MAX_CONNS             8       connection rejected (slots full)
+ * WEB_MAX_CONNS             16      connection rejected (slots full)
  * WEB_MAX_RESPONSE_SIZE     4 MiB   507 Insufficient Storage
  * WS_MAX_FRAME_PAYLOAD      4096    CLOSE 1009 Message Too Big
+ *
+ * When all slots are taken, web_conn_alloc evicts the oldest truly idle
+ * keep-alive slot rather than rejecting, so a browser holding several
+ * keep-alive sockets across page navigations is not held off for the full
+ * keep-alive grace period.  The web_server struct that owns conns[] is
+ * declared static inside web_listen (not on the 16 KiB task stack) so the
+ * slot count can be raised without colliding with deep request-handler
+ * paths (e.g. shell spawn -> proc_load_flat -> buddy_alloc -> printk).
  *
  * Logging on rejection is currently inconsistent: connection-slot
  * exhaustion uses pr_warn, malformed HTTP uses pr_info, and the body /
  * response-size limits are silent.  Log flooding is bounded by
- * WEB_MAX_CONNS (8 slots) and the TCP layer's per-source-IP connection
- * limit (TCP_MAX_CONNS_PER_IP = 8 in kernel/net/tcp.c).
+ * WEB_MAX_CONNS (16 slots) and the TCP layer's per-source-IP connection
+ * limit (TCP_MAX_CONNS_PER_IP = 32 in kernel/net/tcp.c).
  */
 
 /* HTTP request parsing and response creation */
@@ -1837,25 +1845,38 @@ static struct result http_handle_request(struct ram_fs_node *root,
     }
 
     /* JSON API routes. */
-    if (str_is_equal(path, STR("/api/stats")) && req.method == HTTP_METHOD_GET)
-        return http_serve_api_stats(keep_alive, response_buf, tmp);
+    if (str_is_equal(path, STR("/api/stats")) &&
+        req.method == HTTP_METHOD_GET) {
+        *keep_alive_out = false;
+        return http_serve_api_stats(false, response_buf, tmp);
+    }
 
-    if (str_is_equal(path, STR("/api/tcp")) && req.method == HTTP_METHOD_GET)
-        return http_serve_api_tcp(keep_alive, response_buf, tmp);
+    if (str_is_equal(path, STR("/api/tcp")) && req.method == HTTP_METHOD_GET) {
+        *keep_alive_out = false;
+        return http_serve_api_tcp(false, response_buf, tmp);
+    }
 
-    if (str_is_equal(path, STR("/api/arp")) && req.method == HTTP_METHOD_GET)
-        return http_serve_api_arp(keep_alive, response_buf, tmp);
+    if (str_is_equal(path, STR("/api/arp")) && req.method == HTTP_METHOD_GET) {
+        *keep_alive_out = false;
+        return http_serve_api_arp(false, response_buf, tmp);
+    }
 
     if (str_is_equal(path, STR("/api/fs/read")) &&
-        req.method == HTTP_METHOD_GET)
-        return http_serve_api_fs_read(query, keep_alive, response_buf, tmp);
+        req.method == HTTP_METHOD_GET) {
+        *keep_alive_out = false;
+        return http_serve_api_fs_read(query, false, response_buf, tmp);
+    }
 
-    if (str_is_equal(path, STR("/api/fs")) && req.method == HTTP_METHOD_GET)
-        return http_serve_api_fs(query, keep_alive, response_buf, tmp);
+    if (str_is_equal(path, STR("/api/fs")) && req.method == HTTP_METHOD_GET) {
+        *keep_alive_out = false;
+        return http_serve_api_fs(query, false, response_buf, tmp);
+    }
 
 #if CONFIG_WEB_TELEMETRY
-    if (str_is_equal(path, STR("/api/klog")) && req.method == HTTP_METHOD_GET)
-        return http_serve_api_klog(keep_alive, response_buf, tmp);
+    if (str_is_equal(path, STR("/api/klog")) && req.method == HTTP_METHOD_GET) {
+        *keep_alive_out = false;
+        return http_serve_api_klog(false, response_buf, tmp);
+    }
 #endif
 
     /* RFC 7231 §4: static file handler only supports GET.
@@ -1877,7 +1898,8 @@ static struct result http_handle_request(struct ram_fs_node *root,
      */
     char *norm_buf = arena_alloc(&tmp, WEB_MAX_REQUEST_PATH + 1);
 
-    return http_serve_file(root, path, if_none_match, keep_alive, norm_buf,
+    *keep_alive_out = false;
+    return http_serve_file(root, path, if_none_match, false, norm_buf,
                            WEB_MAX_REQUEST_PATH, response_buf, out_file_body);
 }
 
@@ -1914,7 +1936,7 @@ static bool http_is_complete_header(struct str request_data)
 
 #define WEB_NUM_RECV_RETRIES 10
 #define WEB_MAX_RESPONSE_SIZE BIT(22) /* 4 MiB */
-#define WEB_MAX_CONNS 8
+#define WEB_MAX_CONNS 16
 #define WEB_KEEPALIVE_TIMEOUT_MS 30000
 
 /* Poll the TCP module for newly received data and store it in 'recv_buf'.
@@ -2371,8 +2393,17 @@ struct web_server {
     struct web_conn conns[WEB_MAX_CONNS];
 };
 
+static void web_conn_free(struct web_conn *wc);
+
 /* Allocate a connection slot and per-connection arena.
- * Returns NULL if no slot is available or kvalloc fails.
+ *
+ * If no slot is free, evict the oldest truly idle keep-alive slot (state
+ * WCS_RECV with no buffered bytes) and reuse it. Without eviction, a browser
+ * that holds several keep-alive sockets across page navigations can saturate
+ * the pool and block new clients for the full 30s keep-alive grace period.
+ *
+ * Returns NULL only if every slot is busy with in-progress work, or kvalloc
+ * fails.
  */
 static struct web_conn *web_conn_alloc(struct web_server *srv,
                                        struct tcp_conn *tcp)
@@ -2384,8 +2415,20 @@ static struct web_conn *web_conn_alloc(struct web_server *srv,
             break;
         }
     }
-    if (!wc)
-        return NULL;
+    if (!wc) {
+        struct web_conn *oldest = NULL;
+        for (sz i = 0; i < WEB_MAX_CONNS; i++) {
+            struct web_conn *c = &srv->conns[i];
+            if (!c->tcp || c->state != WCS_RECV || c->recv_buf.len != 0)
+                continue;
+            if (!oldest || c->last_activity_ms < oldest->last_activity_ms)
+                oldest = c;
+        }
+        if (!oldest)
+            return NULL;
+        web_conn_free(oldest);
+        wc = oldest;
+    }
 
     sz arena_sz = WEB_CONN_ARENA_OVERHEAD + WEB_MAX_RESPONSE_SIZE;
     struct option_byte_array mem = kvalloc_alloc(arena_sz, 64);
@@ -2759,7 +2802,11 @@ struct result web_listen(struct ipv4_addr ip_addr,
                          u16 port,
                          struct ram_fs_node *root)
 {
-    struct web_server srv = {0};
+    /* Off the stack: conns[WEB_MAX_CONNS] would otherwise consume kilobytes of
+     * the 16 KiB task stack and clash with deep request-handler paths (shell
+     * spawn -> proc_load_flat -> buddy_alloc -> printk).
+     */
+    static struct web_server srv;
     struct arena setup =
         arena_new(option_byte_array_checked(kvalloc_alloc(4096, 64)));
     srv.listen_conn = tcp_conn_listen(ip_addr, port, setup);

@@ -36,9 +36,19 @@ VMA-based access control, and the networking API is a direct function
 interface rather than a Berkeley sockets layer. Disk-backed SFS has its own
 block buffer cache (`kernel/fs/bcache.c`); the synthetic and RAM filesystems
 are uncached because their data is either memory-resident or generated on
-demand. These choices keep the system small and auditable. PSE51 syscall coverage is a work-in-progress
-target; the kernel-level primitives that back those syscalls
-(PI mutexes, condvars, semaphores, futexes) are already in place.
+demand. These choices keep the system small and auditable.
+
+PSE51 framing: Mazu implements a bounded PSE51-oriented userspace core with
+deliberate filesystem and multi-process supersets. PSE51 itself is a
+single-process, threaded, no-filesystem profile; Mazu ships a real
+filesystem, `SYS_SPAWN` / `SYS_WAIT`, and multiple PIDs by design, so the
+honest top-level framing of the user-visible environment is closer to
+PSE52 (Realtime Controller System Profile). The kernel-level primitives
+that back PSE51-facing syscalls (PI mutexes, condvars, semaphores,
+futexes, barriers, rwlocks, message queues, POSIX timers) are already
+in place. Per-syscall conformance status, including which entries use a
+Mazu-specific ABI shape rather than the exact POSIX shape, is tracked in
+[`docs/pse51-matrix.md`](docs/pse51-matrix.md).
 
 Core profile:
 

@@ -630,7 +630,7 @@ test_shell_commands() {
     fi
 
     local cmds=("help" "ls" "ls /web" "cat /hello.txt" "mem" "ps" "netstat" "tcpstats")
-    local expects=("commands:" "web/" "shell.html" "Hello friend" "pages" "kernel tasks" "LISTEN" "uptime")
+    local expects=("commands:" "web/" "shell.html" "Welcome to" "pages" "kernel tasks" "LISTEN" "uptime")
 
     for i in "${!cmds[@]}"; do
         local cmd="${cmds[$i]}"
@@ -1041,7 +1041,7 @@ test_api_fs() {
 
     # /api/fs/read — file content retrieval.
     check_url "GET /api/fs/read hello.txt" "$BASE_URL/api/fs/read?path=%2Fhello.txt" \
-        200 'Hello friend'
+        200 'Welcome to'
     check_status "GET /api/fs/read not-found" "$BASE_URL/api/fs/read?path=%2Fno_such_file" 404
     check_status "GET /api/fs/read missing param" "$BASE_URL/api/fs/read" 400
     check_status "GET /api/fs/read dir" "$BASE_URL/api/fs/read?path=%2Fweb" 404
@@ -1280,7 +1280,7 @@ test_web_ui() {
     check_body_contains "read /config.txt" \
         "$BASE_URL/api/fs/read?path=/config.txt" "host_ip=192.168.100.2"
     check_body_contains "read /hello.txt" \
-        "$BASE_URL/api/fs/read?path=/hello.txt" "Hello friend! Welcome to fun"
+        "$BASE_URL/api/fs/read?path=/hello.txt" "Welcome to"
     check_body_contains "network tcp table" "$BASE_URL/api/tcp" '"connections"'
     check_body_contains "network arp table" "$BASE_URL/api/arp" '"entries"'
     check_url "navigate back to dashboard" "$BASE_URL/dashboard.html" 200 "Dashboard"

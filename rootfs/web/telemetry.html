@@ -32,16 +32,6 @@
 </style>
 </head>
 <body>
-
-<nav class="sidebar">
-  <div class="sidebar-title">Mazu OS</div>
-  <a href="/dashboard.html">Dashboard</a>
-  <a href="/files.html">Files</a>
-  <a href="/network.html">Network</a>
-  <a href="/telemetry.html">Telemetry</a>
-  <a href="/shell.html">Shell</a>
-</nav>
-
 <div class="main">
   <div class="page-header">
     <div class="status-dot connecting" id="dot"></div>
@@ -100,113 +90,6 @@
 </div>
 
 <script src="/js/common.js"></script>
-<script>
-'use strict';
-
-var dot = document.getElementById('dot');
-var klogEl = document.getElementById('klog');
-var droppedEl = document.getElementById('dropped');
-
-var WAKEUP_BINS = ['0-10', '10-50', '50-100', '100-500', '500-1000', '>1000'];
-var CALLOUT_BINS = ['0-10', '10-50', '50-100', '100-500', '500-1000', '>1000'];
-
-function renderHist(tableEl, bins, values) {
-    var max = Math.max.apply(null, values.length ? values : [1]);
-    if (max === 0) max = 1;
-    tableEl.innerHTML = '';
-    for (var i = 0; i < bins.length; i++) {
-        var pct = Math.round(100 * (values[i] || 0) / max);
-        var tr = document.createElement('tr');
-        tr.className = 'hist-row';
-        tr.innerHTML = '<td class="hist-label">' + bins[i] + ' us</td>' +
-            '<td><span class="hist-bar" style="width:' + pct + '%"></span></td>' +
-            '<td class="hist-val">' + (values[i] || 0) + '</td>';
-        tableEl.appendChild(tr);
-    }
-}
-
-function refresh() {
-    Promise.all([
-        fetchJSON('/api/stats'),
-        fetchJSON('/api/klog')
-    ]).then(function (arr) {
-        var d = arr[0], klog = arr[1];
-        dot.className = 'status-dot';
-
-        /* Scheduler histograms. */
-        var sched = d.scheduler;
-        document.getElementById('wakeup-max').textContent = sched.wakeup_latency_max_us;
-        renderHist(document.getElementById('wakeup-hist'),
-            WAKEUP_BINS, sched.wakeup_latency_hist);
-
-        /* Callout histogram. */
-        var co = d.callout;
-        document.getElementById('callout-max').textContent = co.max_late_us;
-        renderHist(document.getElementById('callout-hist'),
-            CALLOUT_BINS, co.late_hist);
-
-        /* Context switch stats. */
-        document.getElementById('val-ctxsw').textContent = sched.nr_ctxsw;
-        document.getElementById('val-ctxsw-avg').textContent = sched.ctxsw_avg_cycles;
-        document.getElementById('val-ctxsw-max').textContent = sched.ctxsw_max_cycles;
-
-        /* Security / watchdog. */
-        document.getElementById('val-denied').textContent = d.security.nr_denied;
-        document.getElementById('val-enosys').textContent = d.security.nr_enosys;
-        document.getElementById('val-hung').textContent = d.watchdog.nr_hung;
-        document.getElementById('val-warn').textContent = d.watchdog.nr_warnings;
-
-        /* Per-hart heartbeat. */
-        var hbBody = document.getElementById('heartbeat-body');
-        hbBody.innerHTML = '';
-        if (d.cpus) {
-            for (var ci = 0; ci < d.cpus.length; ci++) {
-                var cpu = d.cpus[ci];
-                var tr = document.createElement('tr');
-                var state;
-                if (cpu.heartbeat_stale) state = 'STALE';
-                else if (cpu.heartbeat_idle) state = 'idle';
-                else state = 'ok';
-                tr.innerHTML = '<td>' + cpu.cpu + '</td>' +
-                    '<td>' + (cpu.heartbeat_age_us || 0) + '</td>' +
-                    '<td>' + state + '</td>';
-                if (cpu.heartbeat_stale)
-                    tr.style.color = 'var(--red, red)';
-                hbBody.appendChild(tr);
-            }
-        }
-
-        /* Scheduling domains. */
-        var domBody = document.getElementById('domain-body');
-        domBody.innerHTML = '';
-        if (d.domains) {
-            var names = ['web', 'sys'];
-            for (var di = 0; di < d.domains.length; di++) {
-                var dm = d.domains[di];
-                var tr = document.createElement('tr');
-                tr.innerHTML = '<td>' + (names[dm.id] || dm.id) + '</td>' +
-                    '<td>' + dm.state + '</td>' +
-                    '<td>' + dm.nr_members + '</td>' +
-                    '<td>' + dm.quantum_ticks + '</td>' +
-                    '<td>' + dm.consumed_ticks + '</td>';
-                domBody.appendChild(tr);
-            }
-        }
-
-        /* Kernel log. */
-        klogEl.textContent = klog.log;
-        klogEl.scrollTop = klogEl.scrollHeight;
-        if (klog.dropped > 0) {
-            droppedEl.textContent = klog.dropped + ' bytes dropped';
-        } else {
-            droppedEl.textContent = '';
-        }
-    }).catch(function () {
-        dot.className = 'status-dot offline';
-    });
-}
-
-createPoller(refresh, 2000).start();
-</script>
+<script src="/js/telemetry.js"></script>
 </body>
 </html>
